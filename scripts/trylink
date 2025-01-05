@@ -6,7 +6,6 @@ debug=false
 # Linker flags used:
 #
 # Informational:
-# --warn-common
 # -Map $EXE.map
 # --verbose
 #
@@ -18,8 +17,8 @@ debug=false
 # -On                           Not used, maybe useful?
 #
 # List of files to link:
-# $l_list                       == --start-group -llib1 -llib2 --end-group
-# --start-group $O_FILES $A_FILES --end-group
+# $l_list                       == -llib1 -llib2
+# $O_FILES $A_FILES
 #
 # Shared library link:
 # -shared                       self-explanatory
@@ -93,10 +92,10 @@ if ! check_cc "-Wl,--sort-section,alignment"; then
     SORT_SECTION=""
 fi
 
-START_GROUP="-Wl,--start-group"
-END_GROUP="-Wl,--end-group"
+START_GROUP=""
+END_GROUP=""
 INFO_OPTS() {
-	echo "-Wl,--warn-common -Wl,-Map,$EXE.map -Wl,--verbose"
+	echo "-Wl,-Map,$EXE.map -Wl,--verbose"
 }
 
 # gold may not support --sort-common (yet)
@@ -320,7 +319,6 @@ int main(int argc, char **argv)
 		$SORT_SECTION \
 		$GC_SECTIONS \
 		-L"$sharedlib_dir" -lbusybox \
-		-Wl,--warn-common \
 	|| {
 	    echo "Linking $EXE failed"
 	    cat $EXE.out
