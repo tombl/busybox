@@ -114,25 +114,25 @@ void* FAST_FUNC mmap_read(int fd, size_t size)
 	off_t current_pos;
 	void *buf;
 	ssize_t read_size;
-	
+
 	current_pos = lseek(fd, 0, SEEK_CUR);
 	if (current_pos < 0)
 		return MAP_FAILED;
-	
+
 	buf = xmalloc(size);
 	if (!buf)
 		return MAP_FAILED;
-	
+
 	xlseek(fd, 0, SEEK_SET);
-	
+
 	read_size = full_read(fd, buf, size);
 	if (read_size < 0 || (size_t)read_size != size) {
 		free(buf);
 		return MAP_FAILED;
 	}
-	
+
 	xlseek(fd, current_pos, SEEK_SET);
-	
+
 	return buf;
 }
 
@@ -141,7 +141,7 @@ void* FAST_FUNC mmap_anon(size_t size)
 	void *buf = xzalloc(size);
 	if (!buf)
 		return MAP_FAILED;
-	
+
 	return buf;
 }
 
@@ -747,22 +747,6 @@ pid_t FAST_FUNC xfork(void)
 	return pid;
 }
 #endif
-
-void FAST_FUNC xvfork_parent_waits_and_exits(void)
-{
-	pid_t pid;
-
-	fflush_all();
-	pid = xvfork();
-	if (pid > 0) {
-		/* Parent */
-		int exit_status = wait_for_exitstatus(pid);
-		if (WIFSIGNALED(exit_status))
-			kill_myself_with_sig(WTERMSIG(exit_status));
-		_exit(WEXITSTATUS(exit_status));
-	}
-	/* Child continues */
-}
 
 // Useful when we do know that pid is valid, and we just want to wait
 // for it to exit. Not existing pid is fatal. waitpid() status is not returned.

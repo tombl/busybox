@@ -16,6 +16,7 @@
  */
 #include "busybox.h" /* uses applet tables */
 #include "NUM_APPLETS.h"
+#include <sched.h>   /* for clone() */
 
 #define NOFORK_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_NOFORK))
 #define NOEXEC_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE))
@@ -171,40 +172,50 @@ void FAST_FUNC run_noexec_applet_and_exit(int a, const char *name, char **argv)
  * Higher-level code, hiding optional NOFORK/NOEXEC trickery.
  */
 
-/* This does a fork/exec in one call, using vfork().  Returns PID of new child,
- * -1 for failure.  Runs argv[0], searching path if that has no / in it. */
+struct spawn_args {
+	char **argv;
+	volatile int *failed;
+};
+
+static int spawn_child_func(void *arg)
+{
+	struct spawn_args *args = (struct spawn_args *)arg;
+	
+	/* This macro is ok - it doesn't do NOEXEC/NOFORK tricks */
+	BB_EXECVP(args->argv[0], args->argv);
+	
+	/* We are sharing a stack with blocked parent,
+	 * let parent know we failed and then exit to unblock parent
+	 */
+	*args->failed = errno;
+	_exit(111);
+}
+
+/* This does a fork/exec in one call, using clone(). Returns PID of new child,
+ * -1 for failure. Runs argv[0], searching path if that has no / in it. */
 pid_t FAST_FUNC spawn(char **argv)
 {
 	/* Compiler should not optimize stores here */
 	volatile int failed;
 	pid_t pid;
+	char child_stack[4096];
+	struct spawn_args args;
 
 	fflush_all();
 
-	/* Be nice to nommu machines. */
 	failed = 0;
-	pid = vfork();
+	args.argv = argv;
+	args.failed = &failed;
+	
+	pid = clone(spawn_child_func, 
+		child_stack + sizeof(child_stack),
+		CLONE_VM | CLONE_VFORK | SIGCHLD, 
+		&args);
+
 	if (pid < 0) /* error */
 		return pid;
-	if (!pid) { /* child */
-		/* This macro is ok - it doesn't do NOEXEC/NOFORK tricks */
-		BB_EXECVP(argv[0], argv);
-
-		/* We are (maybe) sharing a stack with blocked parent,
-		 * let parent know we failed and then exit to unblock parent
-		 * (but don't run atexit() stuff, which would screw up parent.)
-		 */
-		failed = errno;
-		/* mount, for example, does not want the message */
-		/*bb_perror_msg("can't execute '%s'", argv[0]);*/
-		_exit(111);
-	}
-	/* parent */
-	/* Unfortunately, this is not reliable: according to standards
-	 * vfork() can be equivalent to fork() and we won't see value
-	 * of 'failed'.
-	 * Interested party can wait on pid and learn exit code.
-	 * If 111 - then it (most probably) failed to exec */
+		
+	/* parent continues here after child calls execve or _exit */
 	if (failed) {
 		safe_waitpid(pid, NULL, 0); /* prevent zombie */
 		errno = failed;
@@ -258,6 +269,17 @@ void FAST_FUNC re_exec(char **argv)
 	bb_perror_msg_and_die("can't execute '%s'", bb_busybox_exec_path);
 }
 
+struct rexec_args {
+	char **argv;
+};
+
+static int rexec_child_func(void *data)
+{
+	struct rexec_args *args = (struct rexec_args *)data;
+	re_exec(args->argv); /* NORETURN */
+	return 0; /* Never reached */
+}
+
 pid_t FAST_FUNC fork_or_rexec(char **argv)
 {
 	pid_t pid;
@@ -267,9 +289,18 @@ pid_t FAST_FUNC fork_or_rexec(char **argv)
 
 	/* fflush_all(); ? - so far all callers had no buffered output to flush */
 
-	pid = xvfork();
-	if (pid == 0) /* child - re-exec ourself */
-		re_exec(argv); /* NORETURN */
+	{
+		char child_stack[4096];
+		struct rexec_args args = { .argv = argv };
+
+		pid = clone(rexec_child_func,
+			child_stack + sizeof(child_stack),
+			CLONE_VM | CLONE_VFORK | SIGCHLD,
+			&args);
+
+		if (pid < 0)
+			bb_simple_perror_msg_and_die("clone");
+	}
 
 	/* parent */
 	argv[0][0] &= 0x7f; /* undo re_rexec() damage */

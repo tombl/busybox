@@ -355,6 +355,7 @@
 #endif
 #include <sys/times.h>
 #include <sys/utsname.h> /* for setting $HOSTNAME */
+#include <sched.h>
 
 #include "busybox.h"  /* for APPLET_IS_NOFORK/NOEXEC */
 #include "unicode.h"
@@ -7791,6 +7792,36 @@ static int process_command_subs(o_string *dest, const char *s)
 }
 #endif /* ENABLE_HUSH_TICK */
 
+struct setup_heredoc_args {
+    struct redir_struct *redir;
+    struct fd_pair *pair;
+    const char *heredoc;
+    int len;
+#if !BB_MMU
+	char **to_free;
+#endif
+};
+
+static int setup_heredoc_grandchild(void *arg) {
+	struct setup_heredoc_args *args = arg;
+	close(args->redir->rd_fd); /* read side of the pipe */
+#if BB_MMU
+	full_write(args->pair->wr, args->heredoc, args->len); /* may loop or block */
+	_exit(0);
+#else
+	/* Delegate blocking writes to another process */
+	xmove_fd(args->pair->wr, STDOUT_FILENO);
+	re_execute_shell(&args->to_free, args->heredoc, NULL, NULL, NULL);
+#endif
+}
+
+static int setup_heredoc_child(void *arg) {
+    char child_stack[2048];
+	disable_restore_tty_pgrp_on_exit();
+	clone(setup_heredoc_grandchild, child_stack, CLONE_VM | CLONE_VFORK | SIGCHLD, arg);
+	_exit(0);
+}
+
 static void setup_heredoc(struct redir_struct *redir)
 {
 	struct fd_pair pair;
@@ -7802,6 +7833,7 @@ static void setup_heredoc(struct redir_struct *redir)
 #if !BB_MMU
 	char **to_free;
 #endif
+    char child_stack[4096];
 
 	expanded = NULL;
 	if (!(redir->rd_dup & HEREDOC_QUOTED)) {
@@ -7840,24 +7872,15 @@ static void setup_heredoc(struct redir_struct *redir)
 #if !BB_MMU
 	to_free = NULL;
 #endif
-	pid = xvfork();
-	if (pid == 0) {
-		/* child */
-		disable_restore_tty_pgrp_on_exit();
-		pid = BB_MMU ? xfork() : xvfork();
-		if (pid != 0)
-			_exit(0);
-		/* grandchild */
-		close(redir->rd_fd); /* read side of the pipe */
-#if BB_MMU
-		full_write(pair.wr, heredoc, len); /* may loop or block */
-		_exit(0);
-#else
-		/* Delegate blocking writes to another process */
-		xmove_fd(pair.wr, STDOUT_FILENO);
-		re_execute_shell(&to_free, heredoc, NULL, NULL, NULL);
+    struct setup_heredoc_args args;
+    args.redir = redir;
+    args.pair = &pair;
+    args.heredoc = heredoc;
+    args.len = len;
+#if !BB_MMU
+    args.to_free = to_free;
 #endif
-	}
+    clone(setup_heredoc_child, child_stack, CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
 	/* parent */
 #if ENABLE_HUSH_FAST
 	G.count_SIGCHLD++;
@@ -7865,7 +7888,7 @@ static void setup_heredoc(struct redir_struct *redir)
 #endif
 	enable_restore_tty_pgrp_on_exit();
 #if !BB_MMU
-	free(to_free);
+	free(args.to_free);
 #endif
 	close(pair.wr);
 	free(expanded);
@@ -9351,6 +9374,85 @@ static int redirect_and_varexp_helper(
 
 	return setup_redirects(command, sqp);
 }
+
+struct run_pipe_args {
+    struct pipe *pi;
+    struct command *command;
+    struct squirrel **squirrel;
+    char **argv_expanded;
+#if !BB_MMU
+    struct nommu_save_t *volatile nommu_save;
+#endif
+    struct fd_pair *pipefds;
+    int *next_infd;
+};
+
+static int run_pipe_child(void *arg)
+{
+    struct run_pipe_args *args = (struct run_pipe_args *)arg;
+    struct pipe *pi = args->pi;
+    struct command *command = args->command;
+    struct squirrel **squirrel = args->squirrel;
+    char **argv_expanded = args->argv_expanded;
+    struct fd_pair *pipefds = args->pipefds;
+    int *next_infd = args->next_infd;
+
+#if ENABLE_HUSH_JOB
+	disable_restore_tty_pgrp_on_exit();
+	CLEAR_RANDOM_T(&G.random_gen); /* or else $RANDOM repeats in child */
+
+	/* Every child adds itself to new process group
+	 * with pgid == pid_of_first_child_in_pipe */
+	if (G.run_list_level == 1 && G_interactive_fd) {
+		pid_t pgrp;
+		pgrp = pi->pgrp;
+		if (pgrp < 0) /* true for 1st process only */
+			pgrp = getpid();
+		if (setpgid(0, pgrp) == 0
+		 && pi->followup != PIPE_BG
+		 && G_saved_tty_pgrp /* we have ctty */
+		) {
+			/* We do it in *every* child, not just first,
+			 * to avoid races */
+			tcsetpgrp(G_interactive_fd, pgrp);
+		}
+	}
+#endif
+	if (pi->alive_cmds == 0 && pi->followup == PIPE_BG) {
+		/* 1st cmd in backgrounded pipe
+		 * should have its stdin /dev/null'ed */
+		close(0);
+		if (open(bb_dev_null, O_RDONLY))
+			xopen("/", O_RDONLY);
+	} else {
+		xmove_fd(*next_infd, 0);
+	}
+	xmove_fd(pipefds->wr, 1);
+	if (pipefds->rd > 1)
+		close(pipefds->rd);
+	/* Like bash, explicit redirects override pipes,
+	 * and the pipe fd (fd#1) is available for dup'ing:
+	 * "cmd1 2>&1 | cmd2": fd#1 is duped to fd#2, thus stderr
+	 * of cmd1 goes into pipe.
+	 */
+	if (setup_redirects(command, NULL)) {
+		/* Happens when redir file can't be opened:
+		 * $ hush -c 'echo FOO >&2 | echo BAR 3>/qwe/rty; echo BAZ'
+		 * FOO
+		 * hush: can't open '/qwe/rty': No such file or directory
+		 * BAZ
+		 * (echo BAR is not executed, it hits _exit(1) below)
+		 */
+		_exit(1);
+	}
+
+	/* Stores to nommu_save list of env vars putenv'ed
+	 * (NOMMU, on MMU we don't need that) */
+	/* cast away volatility... */
+	pseudo_exec((nommu_save_t*) &args->nommu_save, command, argv_expanded);
+	/* pseudo_exec() does not return */
+}
+
 static NOINLINE int run_pipe(struct pipe *pi)
 {
 	static const char *const null_ptr = NULL;
@@ -9679,63 +9781,18 @@ static NOINLINE int run_pipe(struct pipe *pi)
 		G.execute_lineno = command->lineno;
 #endif
 
-		command->pid = BB_MMU ? fork() : vfork();
-		if (!command->pid) { /* child */
-#if ENABLE_HUSH_JOB
-			disable_restore_tty_pgrp_on_exit();
-			CLEAR_RANDOM_T(&G.random_gen); /* or else $RANDOM repeats in child */
-
-			/* Every child adds itself to new process group
-			 * with pgid == pid_of_first_child_in_pipe */
-			if (G.run_list_level == 1 && G_interactive_fd) {
-				pid_t pgrp;
-				pgrp = pi->pgrp;
-				if (pgrp < 0) /* true for 1st process only */
-					pgrp = getpid();
-				if (setpgid(0, pgrp) == 0
-				 && pi->followup != PIPE_BG
-				 && G_saved_tty_pgrp /* we have ctty */
-				) {
-					/* We do it in *every* child, not just first,
-					 * to avoid races */
-					tcsetpgrp(G_interactive_fd, pgrp);
-				}
-			}
+        char child_stack[4096];
+        struct run_pipe_args args;
+        args.pi = pi;
+        args.command = command;
+        args.squirrel = squirrel;
+        args.argv_expanded = argv_expanded;
+#if !BB_MMU
+        args.nommu_save = &nommu_save;
 #endif
-			if (pi->alive_cmds == 0 && pi->followup == PIPE_BG) {
-				/* 1st cmd in backgrounded pipe
-				 * should have its stdin /dev/null'ed */
-				close(0);
-				if (open(bb_dev_null, O_RDONLY))
-					xopen("/", O_RDONLY);
-			} else {
-				xmove_fd(next_infd, 0);
-			}
-			xmove_fd(pipefds.wr, 1);
-			if (pipefds.rd > 1)
-				close(pipefds.rd);
-			/* Like bash, explicit redirects override pipes,
-			 * and the pipe fd (fd#1) is available for dup'ing:
-			 * "cmd1 2>&1 | cmd2": fd#1 is duped to fd#2, thus stderr
-			 * of cmd1 goes into pipe.
-			 */
-			if (setup_redirects(command, NULL)) {
-				/* Happens when redir file can't be opened:
-				 * $ hush -c 'echo FOO >&2 | echo BAR 3>/qwe/rty; echo BAZ'
-				 * FOO
-				 * hush: can't open '/qwe/rty': No such file or directory
-				 * BAZ
-				 * (echo BAR is not executed, it hits _exit(1) below)
-				 */
-				_exit(1);
-			}
-
-			/* Stores to nommu_save list of env vars putenv'ed
-			 * (NOMMU, on MMU we don't need that) */
-			/* cast away volatility... */
-			pseudo_exec((nommu_save_t*) &nommu_save, command, argv_expanded);
-			/* pseudo_exec() does not return */
-		}
+        args.pipefds = &pipefds;
+        args.next_infd = &pipefds.rd;
+		command->pid = clone(run_pipe_child, child_stack, CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
 
 		/* parent or error */
 #if ENABLE_HUSH_FAST

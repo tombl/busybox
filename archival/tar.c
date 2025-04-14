@@ -116,6 +116,7 @@
 //kbuild:lib-$(CONFIG_TAR) += tar.o
 
 #include <fnmatch.h>
+#include <sched.h>   /* for clone() */
 #include "libbb.h"
 #include "common_bufsiz.h"
 #include "bb_archive.h"
@@ -569,77 +570,83 @@ static int FAST_FUNC writeFileToTarball(struct recursive_state *state,
 }
 
 # if SEAMLESS_COMPRESSION
-/* Don't inline: vfork scares gcc and pessimizes code */
-static void NOINLINE vfork_compressor(int tar_fd, const char *gzip)
-{
-	// On Linux, vfork never unpauses parent early, although standard
-	// allows for that. Do we want to waste bytes checking for it?
-#  define WAIT_FOR_CHILD 0
-	volatile int vfork_exec_errno = 0;
+
+struct compressor_info {
+	int tar_fd;
+	const char *gzip;
 	struct fd_pair data;
-#  if WAIT_FOR_CHILD
-	struct fd_pair status;
-	xpiped_pair(status);
-#  endif
-	xpiped_pair(data);
+	volatile int *exec_err;
+};
+
+static int compressor_child_func(void *data)
+{
+	struct compressor_info *info = (struct compressor_info *)data;
+	int tfd;
+
+	/* NB: close _first_, then move fds! */
+	close(info->data.wr);
+
+	/* copy it: parent's tar_fd variable must not change */
+	tfd = info->tar_fd;
+	if (tfd == 0) {
+		/* Output tar fd may be zero.
+		 * xmove_fd(data.rd, 0) would destroy it.
+		 * Reproducer:
+		 *  exec 0>&-
+		 *  exec 1>&-
+		 *  tar czf Z.tar.gz FILE
+		 * Swapping move_fd's order wouldn't work:
+		 * data.rd is 1 and _it_ would be destroyed.
+		 */
+		tfd = dup(tfd);
+	}
+	xmove_fd(info->data.rd, 0);
+	xmove_fd(tfd, 1);
+
+	/* exec gzip/bzip2/... program */
+	//BB_EXECLP(gzip, gzip, "-f", (char *)0); - WRONG for "xz",
+	// if xz is an enabled applet, it'll be a version which
+	// can only decompress. We do need to execute external
+	// program, not applet.
+	execlp(info->gzip, info->gzip, "-f", (char *)0);
+
+	*info->exec_err = errno;
+	_exit_FAILURE();
+
+	return 0;
+}
+
+static void clone_compressor(int tar_fd, const char *gzip)
+{
+	char child_stack[4096];
+	volatile int clone_exec_errno = 0;
+	pid_t pid;
+	struct compressor_info info;
+
+	xpiped_pair(info.data);
 
 	signal(SIGPIPE, SIG_IGN); /* we only want EPIPE on errors */
 
-	if (xvfork() == 0) {
-		/* child */
-		int tfd;
-		/* NB: close _first_, then move fds! */
-		close(data.wr);
-#  if WAIT_FOR_CHILD
-		close(status.rd);
-		/* status.wr will close only on exec -
-		 * parent waits for this close to happen */
-		fcntl(status.wr, F_SETFD, FD_CLOEXEC);
-#  endif
-		/* copy it: parent's tar_fd variable must not change */
-		tfd = tar_fd;
-		if (tfd == 0) {
-			/* Output tar fd may be zero.
-			 * xmove_fd(data.rd, 0) would destroy it.
-			 * Reproducer:
-			 *  exec 0>&-
-			 *  exec 1>&-
-			 *  tar czf Z.tar.gz FILE
-			 * Swapping move_fd's order wouldn't work:
-			 * data.rd is 1 and _it_ would be destroyed.
-			 */
-			tfd = dup(tfd);
-		}
-		xmove_fd(data.rd, 0);
-		xmove_fd(tfd, 1);
+	/* Setup compressor info struct */
+	info.tar_fd = tar_fd;
+	info.gzip = gzip;
+	info.exec_err = &clone_exec_errno;
 
-		/* exec gzip/bzip2/... program */
-		//BB_EXECLP(gzip, gzip, "-f", (char *)0); - WRONG for "xz",
-		// if xz is an enabled applet, it'll be a version which
-		// can only decompress. We do need to execute external
-		// program, not applet.
-		execlp(gzip, gzip, "-f", (char *)0);
+	pid = clone(compressor_child_func,
+		child_stack + sizeof(child_stack),
+		CLONE_VM | CLONE_VFORK | SIGCHLD,
+		&info
+	);
 
-		vfork_exec_errno = errno;
-		_exit_FAILURE();
-	}
+	if (pid < 0)
+		bb_perror_msg_and_die("clone");
 
 	/* parent */
-	xmove_fd(data.wr, tar_fd);
-	close(data.rd);
-#  if WAIT_FOR_CHILD
-	close(status.wr);
-	while (1) {
-		/* Wait until child execs (or fails to) */
-		char buf;
-		int n = full_read(status.rd, &buf, 1);
-		if (n < 0 /* && errno == EAGAIN */)
-			continue;	/* try it again */
-	}
-	close(status.rd);
-#  endif
-	if (vfork_exec_errno) {
-		errno = vfork_exec_errno;
+	xmove_fd(info.data.wr, tar_fd);
+	close(info.data.rd);
+
+	if (clone_exec_errno) {
+		errno = clone_exec_errno;
 		bb_perror_msg_and_die("can't execute '%s'", gzip);
 	}
 }
@@ -668,7 +675,7 @@ static NOINLINE int writeTarFile(
 
 # if SEAMLESS_COMPRESSION
 	if (gzip)
-		vfork_compressor(tbInfo->tarFd, gzip);
+		clone_compressor(tbInfo->tarFd, gzip);
 # endif
 
 	/* Read the directory/files and iterate over them one at a time */

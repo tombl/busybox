@@ -2,6 +2,7 @@
 /*
  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
  */
+#include <sched.h>   /* for clone() */
 #include "libbb.h"
 #include "bb_archive.h"
 
@@ -95,6 +96,63 @@ void check_errors_in_children(int signo)
 	}
 }
 
+struct transformer_args {
+	int fd;
+	struct fd_pair *fd_pipe;
+#if BB_MMU
+	int signature_skipped;
+	IF_DESKTOP(long long) int FAST_FUNC (*transformer)(transformer_state_t *xstate);
+#else
+    const char *transform_prog;
+#endif
+};
+
+#if BB_MMU
+static int transformer_child_func(void *data)
+{
+	struct transformer_args *args = (struct transformer_args *)data;
+	IF_DESKTOP(long long) int r;
+	transformer_state_t xstate;
+
+	/* Child */
+	close(args->fd_pipe->rd); /* we don't want to read from the parent */
+
+	init_transformer_state(&xstate);
+	xstate.signature_skipped = args->signature_skipped;
+	xstate.src_fd = args->fd;
+	xstate.dst_fd = args->fd_pipe->wr;
+	r = args->transformer(&xstate);
+	if (ENABLE_FEATURE_CLEAN_UP) {
+		close(args->fd_pipe->wr); /* send EOF */
+		close(args->fd);
+	}
+	/* must be _exit! bug was actually seen here */
+	_exit(/*error if:*/ r < 0);
+
+	return 0;
+}
+#else
+static int transformer_child_func(void *data)
+{
+	struct transformer_args *args = (struct transformer_args *)data;
+	char *argv[4];
+
+	/* Child */
+	close(args->fd_pipe->rd); /* we don't want to read from the parent */
+
+	xmove_fd(args->fd, 0);
+	xmove_fd(args->fd_pipe->wr, 1);
+	argv[0] = (char*)args->transform_prog;
+	argv[1] = (char*)"-cf";
+	argv[2] = (char*)"-";
+	argv[3] = NULL;
+	BB_EXECVP(args->transform_prog, argv);
+	bb_perror_msg_and_die("can't execute '%s'", args->transform_prog);
+
+	return 0;
+}
+#endif
+
 /* transformer(), more than meets the eye */
 #if BB_MMU
 void FAST_FUNC fork_transformer(int fd,
@@ -105,46 +163,31 @@ void FAST_FUNC fork_transformer(int fd,
 void FAST_FUNC fork_transformer(int fd, const char *transform_prog)
 #endif
 {
+	char child_stack[4096];
 	struct fd_pair fd_pipe;
-	int pid;
+	struct transformer_args args;
+	pid_t pid;
 
 	xpiped_pair(fd_pipe);
-	pid = BB_MMU ? xfork() : xvfork();
-	if (pid == 0) {
-		/* Child */
-		close(fd_pipe.rd); /* we don't want to read from the parent */
-		// FIXME: error check?
+
+	/* Setup args struct */
+	args.fd = fd;
+	args.fd_pipe = &fd_pipe;
 #if BB_MMU
-		{
-			IF_DESKTOP(long long) int r;
-			transformer_state_t xstate;
-			init_transformer_state(&xstate);
-			xstate.signature_skipped = signature_skipped;
-			xstate.src_fd = fd;
-			xstate.dst_fd = fd_pipe.wr;
-			r = transformer(&xstate);
-			if (ENABLE_FEATURE_CLEAN_UP) {
-				close(fd_pipe.wr); /* send EOF */
-				close(fd);
-			}
-			/* must be _exit! bug was actually seen here */
-			_exit(/*error if:*/ r < 0);
-		}
+	args.signature_skipped = signature_skipped;
+	args.transformer = transformer;
 #else
-		{
-			char *argv[4];
-			xmove_fd(fd, 0);
-			xmove_fd(fd_pipe.wr, 1);
-			argv[0] = (char*)transform_prog;
-			argv[1] = (char*)"-cf";
-			argv[2] = (char*)"-";
-			argv[3] = NULL;
-			BB_EXECVP(transform_prog, argv);
-			bb_perror_msg_and_die("can't execute '%s'", transform_prog);
-		}
+	args.transform_prog = transform_prog;
 #endif
-		/* notreached */
-	}
+
+	pid = clone(transformer_child_func,
+		child_stack + sizeof(child_stack),
+		CLONE_VM | CLONE_VFORK | SIGCHLD,
+		&args
+	);
+
+	if (pid < 0)
+		bb_perror_msg_and_die("clone");
 
 	/* parent process */
 	close(fd_pipe.wr); /* don't want to write to the child */

@@ -1254,15 +1254,6 @@ int BB_EXECVP(const char *file, char *const argv[]) FAST_FUNC;
 #endif
 void BB_EXECVP_or_die(char **argv) NORETURN FAST_FUNC;
 
-/* xvfork() can't be a _function_, return after vfork in child mangles stack
- * in the parent. It must be a macro. */
-#define xvfork() \
-({ \
-	pid_t bb__xvfork_pid = vfork(); \
-	if (bb__xvfork_pid < 0) \
-		bb_simple_perror_msg_and_die("vfork"); \
-	bb__xvfork_pid; \
-})
 #if BB_MMU
 pid_t xfork(void) FAST_FUNC;
 #endif

@@ -4,6 +4,7 @@
  */
 #include "libbb.h"
 #include "bb_archive.h"
+#include <sched.h>
 
 enum {
 	//TAR_FILETYPE,
@@ -58,6 +59,41 @@ static void oct2env(char *env[], int idx, unsigned long val)
 	xputenv(env[idx]);
 }
 
+
+struct child_args {
+	file_header_t *file_header;
+	char **tar_env;
+	int *p;
+	archive_handle_t *archive_handle;
+};
+
+static int child_func(void *data)
+{
+	struct child_args *args = (struct child_args *)data;
+	/* Child */
+	/* str2env(tar_env, TAR_FILETYPE, "f"); - parent should do it once */
+	oct2env(args->tar_env, TAR_MODE, args->file_header->mode);
+	str2env(args->tar_env, TAR_FILENAME, args->file_header->name);
+	str2env(args->tar_env, TAR_REALNAME, args->file_header->name);
+#if ENABLE_FEATURE_TAR_UNAME_GNAME
+	str2env(args->tar_env, TAR_UNAME, args->file_header->tar__uname);
+	str2env(args->tar_env, TAR_GNAME, args->file_header->tar__gname);
+#endif
+	dec2env(args->tar_env, TAR_SIZE, args->file_header->size);
+	dec2env(args->tar_env, TAR_UID, args->file_header->uid);
+	dec2env(args->tar_env, TAR_GID, args->file_header->gid);
+	close(args->p[1]);
+	xdup2(args->p[0], STDIN_FILENO);
+	signal(SIGPIPE, SIG_DFL);
+	execl(args->archive_handle->tar__to_command_shell,
+		args->archive_handle->tar__to_command_shell,
+		"-c",
+		args->archive_handle->tar__to_command,
+		(char *)0);
+	bb_perror_msg_and_die("can't execute '%s'", args->archive_handle->tar__to_command_shell);
+	return 0;
+}
+
 void FAST_FUNC data_extract_to_command(archive_handle_t *archive_handle)
 {
 	file_header_t *file_header = archive_handle->file_header;
@@ -80,31 +116,22 @@ void FAST_FUNC data_extract_to_command(archive_handle_t *archive_handle)
 
 		memset(tar_env, 0, sizeof(tar_env));
 
+		char child_stack[4096];
+		struct child_args args = {
+			.file_header = file_header,
+			.tar_env = tar_env,
+			.p = p,
+			.archive_handle = archive_handle
+		};
+
 		xpipe(p);
-		pid = BB_MMU ? xfork() : xvfork();
-		if (pid == 0) {
-			/* Child */
-			/* str2env(tar_env, TAR_FILETYPE, "f"); - parent should do it once */
-			oct2env(tar_env, TAR_MODE, file_header->mode);
-			str2env(tar_env, TAR_FILENAME, file_header->name);
-			str2env(tar_env, TAR_REALNAME, file_header->name);
-#if ENABLE_FEATURE_TAR_UNAME_GNAME
-			str2env(tar_env, TAR_UNAME, file_header->tar__uname);
-			str2env(tar_env, TAR_GNAME, file_header->tar__gname);
-#endif
-			dec2env(tar_env, TAR_SIZE, file_header->size);
-			dec2env(tar_env, TAR_UID, file_header->uid);
-			dec2env(tar_env, TAR_GID, file_header->gid);
-			close(p[1]);
-			xdup2(p[0], STDIN_FILENO);
-			signal(SIGPIPE, SIG_DFL);
-			execl(archive_handle->tar__to_command_shell,
-				archive_handle->tar__to_command_shell,
-				"-c",
-				archive_handle->tar__to_command,
-				(char *)0);
-			bb_perror_msg_and_die("can't execute '%s'", archive_handle->tar__to_command_shell);
-		}
+		pid = clone(child_func,
+			child_stack + sizeof(child_stack),
+			CLONE_VM | CLONE_VFORK | SIGCHLD,
+			&args
+		);
+		if (pid < 0)
+			bb_perror_msg_and_die("clone");
 		close(p[0]);
 		/* Our caller is expected to do signal(SIGPIPE, SIG_IGN)
 		 * so that we don't die if child don't read all the input: */

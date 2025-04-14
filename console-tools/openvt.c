@@ -31,6 +31,7 @@
 //usage:       "openvt 2 /bin/ash\n"
 
 #include <linux/vt.h>
+#include <sched.h>   /* for clone() */
 #include "libbb.h"
 
 /* "Standard" openvt's man page (we do not support all of this):
@@ -104,23 +105,40 @@ static int find_free_vtno(void)
 	return vtno;
 }
 
-/* vfork scares gcc, it generates bigger code.
- * Keep it away from main program.
- * TODO: move to libbb; or adapt existing libbb's spawn().
- */
-static NOINLINE void vfork_child(char **argv)
+struct child_args {
+	char **argv;
+};
+
+static int child_func(void *data)
 {
-	if (vfork() == 0) {
-		/* CHILD */
-		/* Try to make this VT our controlling tty */
-		setsid(); /* lose old ctty */
-		ioctl(STDIN_FILENO, TIOCSCTTY, 0 /* 0: don't forcibly steal */);
-		//bb_error_msg("our sid %d", getsid(0));
-		//bb_error_msg("our pgrp %d", getpgrp());
-		//bb_error_msg("VT's sid %d", tcgetsid(0));
-		//bb_error_msg("VT's pgrp %d", tcgetpgrp(0));
-		BB_EXECVP_or_die(argv);
-	}
+	struct child_args *args = (struct child_args *)data;
+
+	/* Try to make this VT our controlling tty */
+	setsid(); /* lose old ctty */
+	ioctl(STDIN_FILENO, TIOCSCTTY, 0 /* 0: don't forcibly steal */);
+	//bb_error_msg("our sid %d", getsid(0));
+	//bb_error_msg("our pgrp %d", getpgrp());
+	//bb_error_msg("VT's sid %d", tcgetsid(0));
+	//bb_error_msg("VT's pgrp %d", tcgetpgrp(0));
+	BB_EXECVP_or_die(args->argv);
+	return 0;
+}
+
+static void clone_child(char **argv)
+{
+	char child_stack[4096];
+	struct child_args args = {
+		.argv = argv
+	};
+
+	pid_t pid = clone(child_func,
+		child_stack + sizeof(child_stack),
+		CLONE_VM | CLONE_VFORK | SIGCHLD,
+		&args
+	);
+
+	if (pid < 0)
+		bb_perror_msg_and_die("clone");
 }
 
 int openvt_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
@@ -182,7 +200,7 @@ int openvt_main(int argc UNUSED_PARAM, char **argv)
 	}
 #endif
 
-	vfork_child(argv);
+	clone_child(argv);
 	if (flags & OPT_w) {
 		/* We have only one child, wait for it */
 		safe_waitpid(-1, NULL, 0); /* loops on EINTR */
