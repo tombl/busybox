@@ -108,6 +108,57 @@ void* FAST_FUNC xmemdup(const void *s, size_t n)
 	return memcpy(xmalloc(n), s, n);
 }
 
+#ifdef __wasm__
+void* FAST_FUNC mmap_read(int fd, size_t size)
+{
+	off_t current_pos;
+	void *buf;
+	ssize_t read_size;
+	
+	current_pos = lseek(fd, 0, SEEK_CUR);
+	if (current_pos < 0)
+		return MAP_FAILED;
+	
+	buf = xmalloc(size);
+	if (!buf)
+		return MAP_FAILED;
+	
+	xlseek(fd, 0, SEEK_SET);
+	
+	read_size = full_read(fd, buf, size);
+	if (read_size < 0 || (size_t)read_size != size) {
+		free(buf);
+		return MAP_FAILED;
+	}
+	
+	xlseek(fd, current_pos, SEEK_SET);
+	
+	return buf;
+}
+
+void* FAST_FUNC mmap_anon(size_t size)
+{
+	void *buf = xzalloc(size);
+	if (!buf)
+		return MAP_FAILED;
+	
+	return buf;
+}
+
+void* FAST_FUNC xmmap_anon(size_t size)
+{
+	void *p = mmap_anon(size);
+	if (p == MAP_FAILED)
+		bb_die_memory_exhausted();
+	return p;
+}
+
+int munmap(void *addr, size_t length)
+{
+	free(addr);
+	return 0;
+}
+#else
 void* FAST_FUNC mmap_read(int fd, size_t size)
 {
 	return mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -128,6 +179,7 @@ void* FAST_FUNC xmmap_anon(size_t size)
 		bb_die_memory_exhausted();
 	return p;
 }
+#endif
 
 // Die if we can't open a file and return a FILE* to it.
 // Notice we haven't got xfread(), This is for use with fscanf() and friends.

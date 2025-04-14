@@ -40,7 +40,9 @@
 #define basename dont_use_basename
 #include <poll.h>
 #include <sys/ioctl.h>
+#ifndef __wasm__
 #include <sys/mman.h>
+#endif
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -441,6 +443,11 @@ void *xmemdup(const void *s, size_t n) FAST_FUNC RETURNS_MALLOC;
 void *mmap_read(int fd, size_t size) FAST_FUNC;
 void *mmap_anon(size_t size) FAST_FUNC;
 void *xmmap_anon(size_t size) FAST_FUNC;
+
+#ifdef __wasm__
+#define MAP_FAILED ((void *) -1)
+int munmap(void *addr, size_t length);
+#endif
 
 #if defined(__x86_64__) || defined(i386)
 # define BB_ARCH_FIXED_PAGESIZE 4096
