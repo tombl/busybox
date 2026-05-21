@@ -7818,7 +7818,8 @@ static int setup_heredoc_grandchild(void *arg) {
 static int setup_heredoc_child(void *arg) {
     char child_stack[2048];
 	disable_restore_tty_pgrp_on_exit();
-	clone(setup_heredoc_grandchild, child_stack, CLONE_VM | CLONE_VFORK | SIGCHLD, arg);
+	clone(setup_heredoc_grandchild, child_stack + sizeof(child_stack),
+		CLONE_VM | CLONE_VFORK | SIGCHLD, arg);
 	_exit(0);
 }
 
@@ -7880,7 +7881,8 @@ static void setup_heredoc(struct redir_struct *redir)
 #if !BB_MMU
     args.to_free = to_free;
 #endif
-    clone(setup_heredoc_child, child_stack, CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
+    clone(setup_heredoc_child, child_stack + sizeof(child_stack),
+		CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
 	/* parent */
 #if ENABLE_HUSH_FAST
 	G.count_SIGCHLD++;
@@ -9792,7 +9794,8 @@ static NOINLINE int run_pipe(struct pipe *pi)
 #endif
         args.pipefds = &pipefds;
         args.next_infd = &pipefds.rd;
-		command->pid = clone(run_pipe_child, child_stack, CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
+		command->pid = clone(run_pipe_child, child_stack + sizeof(child_stack),
+			CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
 
 		/* parent or error */
 #if ENABLE_HUSH_FAST
