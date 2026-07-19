@@ -673,12 +673,31 @@ handle_retr(void)
 
 /* List commands */
 
+struct ftpd_ls_args {
+	const char **argv;
+	struct fd_pair output;
+};
+
+static int ftpd_ls_child(void *data)
+{
+	struct ftpd_ls_args *args = data;
+	int status;
+
+	close(args->output.rd);
+	xmove_fd(args->output.wr, STDOUT_FILENO);
+	close(STDIN_FILENO);
+	dup(STDOUT_FILENO);
+	status = ls_main(0, (char **) args->argv);
+	fflush_all();
+	return status;
+}
+
 static int
 popen_ls(const char *opt)
 {
 	const char *argv[5];
 	struct fd_pair outfd;
-	pid_t pid;
+	struct ftpd_ls_args args;
 
 	argv[0] = "ftpd";
 	argv[1] = opt; /* "-lA" or "-1A" */
@@ -701,42 +720,9 @@ popen_ls(const char *opt)
 	xpiped_pair(outfd);
 
 	/*fflush_all(); - so far we dont use stdio on output */
-	pid = BB_MMU ? xfork() : xvfork();
-	if (pid == 0) {
-#if !BB_MMU
-		int cur_fd;
-#endif
-		/* child */
-		/* NB: close _first_, then move fd! */
-		close(outfd.rd);
-		xmove_fd(outfd.wr, STDOUT_FILENO);
-		/* Opening /dev/null in chroot is hard.
-		 * Just making sure STDIN_FILENO is opened
-		 * to something harmless. Paranoia,
-		 * ls won't read it anyway */
-		close(STDIN_FILENO);
-		dup(STDOUT_FILENO); /* copy will become STDIN_FILENO */
-#if BB_MMU
-		/* memset(&G, 0, sizeof(G)); - ls_main does it */
-		exit(ls_main(/*argc_unused*/ 0, (char**) argv));
-#else
-		cur_fd = xopen(".", O_RDONLY | O_DIRECTORY);
-		/* On NOMMU, we want to execute a child - copy of ourself
-		 * in order to unblock parent after vfork.
-		 * In chroot we usually can't re-exec. Thus we escape
-		 * out of the chroot back to original root.
-		 */
-		if (G.root_fd >= 0) {
-			if (fchdir(G.root_fd) != 0 || chroot(".") != 0)
-				_exit(127);
-			/*close(G.root_fd); - close_on_exec_on() took care of this */
-		}
-		/* Child expects directory to list on fd #3 */
-		xmove_fd(cur_fd, 3);
-		execv(bb_busybox_exec_path, (char**) argv);
-		_exit(127);
-#endif
-	}
+	args.argv = argv;
+	args.output = outfd;
+	xclone(ftpd_ls_child, 0, &args);
 
 	/* parent */
 	close(outfd.wr);

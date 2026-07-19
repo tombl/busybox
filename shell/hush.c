@@ -355,7 +355,6 @@
 #endif
 #include <sys/times.h>
 #include <sys/utsname.h> /* for setting $HOSTNAME */
-#include <sched.h>
 
 #include "busybox.h"  /* for APPLET_IS_NOFORK/NOEXEC */
 #include "unicode.h"
@@ -7371,6 +7370,7 @@ static void switch_off_special_sigs(unsigned mask)
 void re_execute_shell(char ***to_free, const char *s,
 		char *g_argv0, char **g_argv,
 		char **builtin_argv) NORETURN;
+#endif
 
 static void reset_traps_to_defaults(void)
 {
@@ -7391,14 +7391,14 @@ static void reset_traps_to_defaults(void)
 
 	/* Switch off special sigs */
 	switch_off_special_sigs(mask);
-# if ENABLE_HUSH_JOB
+#if ENABLE_HUSH_JOB
 	G_fatal_sig_mask = 0;
-# endif
+#endif
 	G.special_sig_mask &= ~SPECIAL_INTERACTIVE_SIGS;
 	/* SIGQUIT,SIGCHLD and maybe SPECIAL_JOBSTOP_SIGS
 	 * remain set in G.special_sig_mask */
 
-# if ENABLE_HUSH_TRAP
+#if ENABLE_HUSH_TRAP
 	if (!G_traps)
 		return;
 
@@ -7416,10 +7416,10 @@ static void reset_traps_to_defaults(void)
 			continue;
 		install_sighandler(sig, pick_sighandler(sig));
 	}
-# endif
+#endif
 }
 
-#else /* !BB_MMU */
+#if !BB_MMU
 
 static void re_execute_shell(char ***to_free, const char *s,
 		char *g_argv0, char **g_argv,
@@ -7649,18 +7649,18 @@ static void parse_and_run_file(HFILE *fp)
 }
 
 #if ENABLE_HUSH_TICK
-static int generate_stream_from_string(const char *s, pid_t *pid_p)
-{
-	pid_t pid;
-	int channel[2];
-# if !BB_MMU
-	char **to_free = NULL;
-# endif
+struct command_sub_args {
+	const char *string;
+	int read_fd;
+	int write_fd;
+};
 
-	xpipe(channel);
-	pid = BB_MMU ? xfork() : xvfork();
-	if (pid == 0) { /* child */
-		disable_restore_tty_pgrp_on_exit();
+static int command_sub_child(void *data)
+{
+	struct command_sub_args *args = data;
+	const char *s = args->string;
+
+	disable_restore_tty_pgrp_on_exit();
 		/* Process substitution is not considered to be usual
 		 * 'command execution'.
 		 * SUSv3 says ctrl-Z should be ignored, ctrl-C should not.
@@ -7670,8 +7670,8 @@ static int generate_stream_from_string(const char *s, pid_t *pid_p)
 			+ (1 << SIGTTIN)
 			+ (1 << SIGTTOU)
 			, SIG_IGN);
-		close(channel[0]); /* NB: close _first_, then move fd! */
-		xmove_fd(channel[1], 1);
+		close(args->read_fd); /* NB: close _first_, then move fd! */
+		xmove_fd(args->write_fd, 1);
 # if ENABLE_HUSH_TRAP
 		/* Awful hack for `trap` or $(trap).
 		 *
@@ -7717,7 +7717,6 @@ static int generate_stream_from_string(const char *s, pid_t *pid_p)
 			_exit(0);
 		}
 # endif
-# if BB_MMU
 		/* Prevent it from trying to handle ctrl-z etc */
 		IF_HUSH_JOB(G.run_list_level = 1;)
 		CLEAR_RANDOM_T(&G.random_gen); /* or else $RANDOM repeats in child */
@@ -7726,22 +7725,20 @@ static int generate_stream_from_string(const char *s, pid_t *pid_p)
 		//bb_error_msg("%s: ++x_mode_depth=%d", __func__, G.x_mode_depth);
 		parse_and_run_string(s);
 		_exit(G.last_exitcode);
-# else
-	/* We re-execute after vfork on NOMMU. This makes this script safe:
-	 * yes "0123456789012345678901234567890" | dd bs=32 count=64k >BIG
-	 * huge=`cat BIG` # was blocking here forever
-	 * echo OK
-	 */
-		re_execute_shell(&to_free,
-				s,
-				G.global_argv[0],
-				G.global_argv + 1,
-				NULL);
-# endif
-	}
+}
+
+static int generate_stream_from_string(const char *s, pid_t *pid_p)
+{
+	int channel[2];
+	struct command_sub_args args;
+
+	xpipe(channel);
+	args.string = s;
+	args.read_fd = channel[0];
+	args.write_fd = channel[1];
+	*pid_p = xclone(command_sub_child, 0, &args);
 
 	/* parent */
-	*pid_p = pid;
 # if ENABLE_HUSH_FAST
 	G.count_SIGCHLD++;
 //bb_error_msg("[%d] fork in generate_stream_from_string:"
@@ -7749,9 +7746,6 @@ static int generate_stream_from_string(const char *s, pid_t *pid_p)
 //		getpid(), G.count_SIGCHLD, G.handled_SIGCHLD);
 # endif
 	enable_restore_tty_pgrp_on_exit();
-# if !BB_MMU
-	free(to_free);
-# endif
 	close(channel[1]);
 	return channel[0];
 }
@@ -7793,34 +7787,25 @@ static int process_command_subs(o_string *dest, const char *s)
 #endif /* ENABLE_HUSH_TICK */
 
 struct setup_heredoc_args {
-    struct redir_struct *redir;
-    struct fd_pair *pair;
-    const char *heredoc;
-    int len;
-#if !BB_MMU
-	char **to_free;
-#endif
+	int read_fd;
+	int write_fd;
+	const char *heredoc;
+	int len;
 };
 
-static int setup_heredoc_grandchild(void *arg) {
+static int setup_heredoc_grandchild(void *arg)
+{
 	struct setup_heredoc_args *args = arg;
-	close(args->redir->rd_fd); /* read side of the pipe */
-#if BB_MMU
-	full_write(args->pair->wr, args->heredoc, args->len); /* may loop or block */
+	close(args->read_fd);
+	full_write(args->write_fd, args->heredoc, args->len);
 	_exit(0);
-#else
-	/* Delegate blocking writes to another process */
-	xmove_fd(args->pair->wr, STDOUT_FILENO);
-	re_execute_shell(&args->to_free, args->heredoc, NULL, NULL, NULL);
-#endif
 }
 
-static int setup_heredoc_child(void *arg) {
-    char child_stack[2048];
+static int setup_heredoc_child(void *arg)
+{
 	disable_restore_tty_pgrp_on_exit();
-	clone(setup_heredoc_grandchild, child_stack + sizeof(child_stack),
-		CLONE_VM | CLONE_VFORK | SIGCHLD, arg);
-	_exit(0);
+	xclone(setup_heredoc_grandchild, 0, arg);
+	return 0;
 }
 
 static void setup_heredoc(struct redir_struct *redir)
@@ -7831,10 +7816,7 @@ static void setup_heredoc(struct redir_struct *redir)
 	/* the _body_ of heredoc (misleading field name) */
 	const char *heredoc = redir->rd_filename;
 	char *expanded;
-#if !BB_MMU
-	char **to_free;
-#endif
-    char child_stack[4096];
+	struct setup_heredoc_args args;
 
 	expanded = NULL;
 	if (!(redir->rd_dup & HEREDOC_QUOTED)) {
@@ -7870,31 +7852,20 @@ static void setup_heredoc(struct redir_struct *redir)
 	 * for the unsuspecting parent process. Child creates a grandchild
 	 * and exits before parent execs the process which consumes heredoc
 	 * (that exec happens after we return from this function) */
-#if !BB_MMU
-	to_free = NULL;
-#endif
-    struct setup_heredoc_args args;
-    args.redir = redir;
-    args.pair = &pair;
-    args.heredoc = heredoc;
-    args.len = len;
-#if !BB_MMU
-    args.to_free = to_free;
-#endif
-    clone(setup_heredoc_child, child_stack + sizeof(child_stack),
-		CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
+	args.read_fd = redir->rd_fd;
+	args.write_fd = pair.wr;
+	args.heredoc = heredoc;
+	args.len = len;
+	pid = xclone(setup_heredoc_child, 0, &args);
 	/* parent */
 #if ENABLE_HUSH_FAST
 	G.count_SIGCHLD++;
 //bb_error_msg("[%d] fork in setup_heredoc: G.count_SIGCHLD:%d G.handled_SIGCHLD:%d", getpid(), G.count_SIGCHLD, G.handled_SIGCHLD);
 #endif
 	enable_restore_tty_pgrp_on_exit();
-#if !BB_MMU
-	free(args.to_free);
-#endif
 	close(pair.wr);
 	free(expanded);
-	wait(NULL); /* wait till child has died */
+	safe_waitpid(pid, NULL, 0); /* wait until the writer is orphaned */
 }
 
 struct squirrel {
@@ -9378,26 +9349,22 @@ static int redirect_and_varexp_helper(
 }
 
 struct run_pipe_args {
-    struct pipe *pi;
-    struct command *command;
-    struct squirrel **squirrel;
-    char **argv_expanded;
+	struct pipe *pi;
+	struct command *command;
+	char **argv_expanded;
 #if !BB_MMU
-    struct nommu_save_t *volatile nommu_save;
+	nommu_save_t nommu_save;
 #endif
-    struct fd_pair *pipefds;
-    int *next_infd;
+	struct fd_pair pipefds;
+	int input_fd;
 };
 
 static int run_pipe_child(void *arg)
 {
-    struct run_pipe_args *args = (struct run_pipe_args *)arg;
-    struct pipe *pi = args->pi;
-    struct command *command = args->command;
-    struct squirrel **squirrel = args->squirrel;
-    char **argv_expanded = args->argv_expanded;
-    struct fd_pair *pipefds = args->pipefds;
-    int *next_infd = args->next_infd;
+	struct run_pipe_args *args = arg;
+	struct pipe *pi = args->pi;
+	struct command *command = args->command;
+	char **argv_expanded = args->argv_expanded;
 
 #if ENABLE_HUSH_JOB
 	disable_restore_tty_pgrp_on_exit();
@@ -9427,11 +9394,11 @@ static int run_pipe_child(void *arg)
 		if (open(bb_dev_null, O_RDONLY))
 			xopen("/", O_RDONLY);
 	} else {
-		xmove_fd(*next_infd, 0);
+		xmove_fd(args->input_fd, 0);
 	}
-	xmove_fd(pipefds->wr, 1);
-	if (pipefds->rd > 1)
-		close(pipefds->rd);
+	xmove_fd(args->pipefds.wr, 1);
+	if (args->pipefds.rd > 1)
+		close(args->pipefds.rd);
 	/* Like bash, explicit redirects override pipes,
 	 * and the pipe fd (fd#1) is available for dup'ing:
 	 * "cmd1 2>&1 | cmd2": fd#1 is duped to fd#2, thus stderr
@@ -9451,7 +9418,11 @@ static int run_pipe_child(void *arg)
 	/* Stores to nommu_save list of env vars putenv'ed
 	 * (NOMMU, on MMU we don't need that) */
 	/* cast away volatility... */
-	pseudo_exec((nommu_save_t*) &args->nommu_save, command, argv_expanded);
+#if BB_MMU
+	pseudo_exec(NULL, command, argv_expanded);
+#else
+	pseudo_exec(&args->nommu_save, command, argv_expanded);
+#endif
 	/* pseudo_exec() does not return */
 }
 
@@ -9757,13 +9728,7 @@ static NOINLINE int run_pipe(struct pipe *pi)
 	cmd_no = 0;
 	while (cmd_no < pi->num_cmds) {
 		struct fd_pair pipefds;
-#if !BB_MMU
-		int sv_var_nest_level = G.var_nest_level;
-		volatile nommu_save_t nommu_save;
-		nommu_save.old_vars = NULL;
-		nommu_save.argv = NULL;
-		nommu_save.argv_from_re_execing = NULL;
-#endif
+		struct run_pipe_args args;
 		command = &pi->cmds[cmd_no];
 		cmd_no++;
 		if (command->argv) {
@@ -9782,20 +9747,15 @@ static NOINLINE int run_pipe(struct pipe *pi)
 #if ENABLE_HUSH_LINENO_VAR
 		G.execute_lineno = command->lineno;
 #endif
-
-        char child_stack[4096];
-        struct run_pipe_args args;
-        args.pi = pi;
-        args.command = command;
-        args.squirrel = squirrel;
-        args.argv_expanded = argv_expanded;
+		args.pi = pi;
+		args.command = command;
+		args.argv_expanded = argv_expanded;
 #if !BB_MMU
-        args.nommu_save = &nommu_save;
+		memset(&args.nommu_save, 0, sizeof(args.nommu_save));
 #endif
-        args.pipefds = &pipefds;
-        args.next_infd = &pipefds.rd;
-		command->pid = clone(run_pipe_child, child_stack + sizeof(child_stack),
-			CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
+		args.pipefds = pipefds;
+		args.input_fd = next_infd;
+		command->pid = bb_clone(run_pipe_child, 0, &args);
 
 		/* parent or error */
 #if ENABLE_HUSH_FAST
@@ -9803,14 +9763,6 @@ static NOINLINE int run_pipe(struct pipe *pi)
 //bb_error_msg("[%d] fork in run_pipe: G.count_SIGCHLD:%d G.handled_SIGCHLD:%d", getpid(), G.count_SIGCHLD, G.handled_SIGCHLD);
 #endif
 		enable_restore_tty_pgrp_on_exit();
-#if !BB_MMU
-		/* Clean up after vforked child */
-		free(nommu_save.argv);
-		free(nommu_save.argv_from_re_execing);
-		G.var_nest_level = sv_var_nest_level;
-		remove_nested_vars();
-		add_vars(nommu_save.old_vars);
-#endif
 		free(argv_expanded);
 		argv_expanded = NULL;
 		if (command->pid < 0) { /* [v]fork failed */

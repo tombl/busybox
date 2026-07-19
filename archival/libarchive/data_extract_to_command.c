@@ -4,7 +4,6 @@
  */
 #include "libbb.h"
 #include "bb_archive.h"
-#include <sched.h>
 
 enum {
 	//TAR_FILETYPE,
@@ -113,25 +112,17 @@ void FAST_FUNC data_extract_to_command(archive_handle_t *archive_handle)
 		pid_t pid;
 		int p[2], status;
 		char *tar_env[TAR_MAX];
+		struct child_args args;
 
 		memset(tar_env, 0, sizeof(tar_env));
 
-		char child_stack[4096];
-		struct child_args args = {
-			.file_header = file_header,
-			.tar_env = tar_env,
-			.p = p,
-			.archive_handle = archive_handle
-		};
+		args.file_header = file_header;
+		args.tar_env = tar_env;
+		args.p = p;
+		args.archive_handle = archive_handle;
 
 		xpipe(p);
-		pid = clone(child_func,
-			child_stack + sizeof(child_stack),
-			CLONE_VM | CLONE_VFORK | SIGCHLD,
-			&args
-		);
-		if (pid < 0)
-			bb_perror_msg_and_die("clone");
+		pid = xclone(child_func, 0, &args);
 		close(p[0]);
 		/* Our caller is expected to do signal(SIGPIPE, SIG_IGN)
 		 * so that we don't die if child don't read all the input: */

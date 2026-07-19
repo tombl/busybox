@@ -40,6 +40,7 @@
 //usage:     "\n	-y LINE	Starting line"
 
 #include "libbb.h"
+#include <sched.h>
 #include "common_bufsiz.h"
 #include <sys/kd.h>
 
@@ -330,10 +331,9 @@ static void create_cdev_if_doesnt_exist(const char* name, dev_t dev)
 		mknod(name, S_IFCHR | 0660, dev);
 }
 
-static NOINLINE void start_shell_in_child(const char* tty_name)
+static int conspy_shell_child(void *data)
 {
-	int pid = xvfork();
-	if (pid == 0) {
+	const char *tty_name = data;
 		struct termios termchild;
 		const char *shell = get_shell_name();
 
@@ -355,7 +355,11 @@ static NOINLINE void start_shell_in_child(const char* tty_name)
 		tcsetattr_stdin_TCSANOW(&termchild);
 		execl(shell, shell, "-i", (char *) NULL);
 		bb_simple_perror_msg_and_die(shell);
-	}
+}
+
+static NOINLINE void start_shell_in_child(const char* tty_name)
+{
+	xclone(conspy_shell_child, CLONE_VM | CLONE_VFORK, (char *) tty_name);
 }
 
 int conspy_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;

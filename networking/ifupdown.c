@@ -140,6 +140,7 @@
 
 #include <net/if.h>
 #include "libbb.h"
+#include <sched.h>
 #include "common_bufsiz.h"
 /* After libbb.h, since it needs sys/types.h on some systems */
 #include <sys/utsname.h>
@@ -1144,6 +1145,17 @@ static void set_environ(struct interface_defn_t *iface, const char *mode, const 
 		*pp++ = setlocalenv("%s=%s", "PATH", G.startup_PATH);
 }
 
+struct ifupdown_command_args {
+	char *command;
+};
+
+static int ifupdown_command_child(void *data)
+{
+	struct ifupdown_command_args *args = data;
+	execle(G.shell, G.shell, "-c", args->command, (char *) NULL, G.my_environ);
+	return 127;
+}
+
 static int doit(char *str)
 {
 	if (option_mask32 & (OPT_no_act|OPT_verbose)) {
@@ -1152,15 +1164,12 @@ static int doit(char *str)
 	if (!(option_mask32 & OPT_no_act)) {
 		pid_t child;
 		int status;
+		struct ifupdown_command_args args = { str };
 
 		fflush_all();
-		child = vfork();
+		child = bb_clone(ifupdown_command_child, CLONE_VM | CLONE_VFORK, &args);
 		if (child < 0) /* failure */
 			return 0;
-		if (child == 0) { /* child */
-			execle(G.shell, G.shell, "-c", str, (char *) NULL, G.my_environ);
-			_exit(127);
-		}
 		safe_waitpid(child, &status, 0);
 		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
 			return 0;
@@ -1225,27 +1234,37 @@ static int iface_down(struct interface_defn_t *iface)
 }
 
 #if ENABLE_FEATURE_IFUPDOWN_MAPPING
+struct mapping_child_args {
+	char **argv;
+	struct fd_pair input;
+	struct fd_pair output;
+};
+
+static int mapping_child(void *data)
+{
+	struct mapping_child_args *args = data;
+	close(args->input.wr);
+	close(args->output.rd);
+	xmove_fd(args->input.rd, STDIN_FILENO);
+	xmove_fd(args->output.wr, STDOUT_FILENO);
+	BB_EXECVP_or_die(args->argv);
+}
+
 static int popen2(FILE **in, FILE **out, char *command, char *param)
 {
 	char *argv[3] = { command, param, NULL };
 	struct fd_pair infd, outfd;
+	struct mapping_child_args args;
 	pid_t pid;
 
 	xpiped_pair(infd);
 	xpiped_pair(outfd);
 
 	fflush_all();
-	pid = xvfork();
-
-	if (pid == 0) {
-		/* Child */
-		/* NB: close _first_, then move fds! */
-		close(infd.wr);
-		close(outfd.rd);
-		xmove_fd(infd.rd, 0);
-		xmove_fd(outfd.wr, 1);
-		BB_EXECVP_or_die(argv);
-	}
+	args.argv = argv;
+	args.input = infd;
+	args.output = outfd;
+	pid = xclone(mapping_child, CLONE_VM | CLONE_VFORK, &args);
 	/* parent */
 	close(infd.rd);
 	close(outfd.wr);

@@ -300,6 +300,47 @@ static int connect_w_timeout(int fd)
 	return rr;
 }
 
+struct nc_persistent_args {
+	int connection_fd;
+	char **argv;
+};
+
+static int nc_persistent_child(void *data)
+{
+	struct nc_persistent_args *args = data;
+
+	signal(SIGCHLD, SIG_DFL);
+	xmove_fd(args->connection_fd, netfd);
+	getsockname(netfd, &ouraddr->u.sa, &ouraddr->len);
+
+	if (o_verbose) {
+		char *lcladdr;
+		char *remaddr;
+		char *remhostname;
+
+#if ENABLE_NC_EXTRA && defined(IP_OPTIONS)
+		char optbuf[40];
+		socklen_t x = sizeof(optbuf);
+		int r = getsockopt(netfd, IPPROTO_IP, IP_OPTIONS, optbuf, &x);
+		if (r >= 0 && x) {
+			*bin2hex(bigbuf_net, optbuf, x) = '\0';
+			fprintf(stderr, "IP options: %s\n", bigbuf_net);
+		}
+#endif
+		lcladdr = xmalloc_sockaddr2dotted(&ouraddr->u.sa);
+		remaddr = xmalloc_sockaddr2dotted(&remend.u.sa);
+		remhostname = o_nflag ? remaddr : xmalloc_sockaddr2host(&remend.u.sa);
+		fprintf(stderr, "connect to %s from %s (%s)\n",
+				lcladdr, remhostname, remaddr);
+		free(lcladdr);
+		free(remaddr);
+		if (!o_nflag)
+			free(remhostname);
+	}
+
+	doexec(args->argv);
+}
+
 /* dolisten:
  listens for
  incoming and returns an open connection *from* someplace.  If we were
@@ -415,15 +456,16 @@ create new one, and bind() it. TODO */
 			bb_simple_error_msg_and_die("timeout");
 
 		if (is_persistent && proggie) {
+			struct nc_persistent_args args = {
+				.connection_fd = rr,
+				.argv = proggie,
+			};
+
 			/* -l -k -e PROG */
 			signal(SIGCHLD, SIG_IGN); /* no zombies please */
-			if (xvfork() != 0) {
-				/* parent: go back and accept more connections */
-				close(rr);
-				goto another;
-			}
-			/* child */
-			signal(SIGCHLD, SIG_DFL);
+			xclone(nc_persistent_child, CLONE_VM | CLONE_VFORK, &args);
+			close(rr);
+			goto another;
 		}
 
 		xmove_fd(rr, netfd); /* dump the old socket, here's our new one */

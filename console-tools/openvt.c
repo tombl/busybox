@@ -31,7 +31,7 @@
 //usage:       "openvt 2 /bin/ash\n"
 
 #include <linux/vt.h>
-#include <sched.h>   /* for clone() */
+#include <sched.h>
 #include "libbb.h"
 
 /* "Standard" openvt's man page (we do not support all of this):
@@ -126,19 +126,11 @@ static int child_func(void *data)
 
 static void clone_child(char **argv)
 {
-	char child_stack[4096];
 	struct child_args args = {
 		.argv = argv
 	};
 
-	pid_t pid = clone(child_func,
-		child_stack + sizeof(child_stack),
-		CLONE_VM | CLONE_VFORK | SIGCHLD,
-		&args
-	);
-
-	if (pid < 0)
-		bb_perror_msg_and_die("clone");
+	xclone(child_func, CLONE_VM | CLONE_VFORK, &args);
 }
 
 int openvt_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;

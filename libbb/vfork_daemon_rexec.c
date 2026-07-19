@@ -21,6 +21,49 @@
 #define NOFORK_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_NOFORK))
 #define NOEXEC_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE))
 
+/* The callback-style clone interface requires a separate child stack.  Keep
+ * stack allocation in one place so process-clone call sites only have to say
+ * whether memory is copied or shared.  A private clone gets its own copy of
+ * this allocation; a CLONE_VM clone must also use CLONE_VFORK, which keeps the
+ * parent here until the child has execed or exited. */
+pid_t FAST_FUNC bb_clone(int (*child_func)(void *), unsigned flags, void *arg)
+{
+	enum { CHILD_STACK_SIZE = 128 * 1024 };
+	void *child_stack;
+	pid_t pid;
+	int errno_save;
+
+	child_stack = malloc(CHILD_STACK_SIZE);
+	if (!child_stack)
+		return -1;
+
+	pid = clone(child_func,
+		(char *) child_stack + CHILD_STACK_SIZE,
+		flags | SIGCHLD,
+		arg);
+	errno_save = errno;
+	free(child_stack);
+	errno = errno_save;
+	return pid;
+}
+
+pid_t FAST_FUNC xclone(int (*child_func)(void *), unsigned flags, void *arg)
+{
+	pid_t pid = bb_clone(child_func, flags, arg);
+	if (pid < 0)
+		bb_simple_perror_msg_and_die("clone");
+	return pid;
+}
+
+void FAST_FUNC bb_clone_parent_waits_and_exits(int (*child_func)(void *), void *arg)
+{
+	int status = wait_for_exitstatus(xclone(child_func, 0, arg));
+
+	if (WIFSIGNALED(status))
+		kill_myself_with_sig(WTERMSIG(status));
+	_exit(WEXITSTATUS(status));
+}
+
 #if defined(__linux__) && (NUM_APPLETS > 1)
 # include <sys/prctl.h>
 # ifndef PR_SET_NAME
@@ -198,7 +241,6 @@ pid_t FAST_FUNC spawn(char **argv)
 	/* Compiler should not optimize stores here */
 	volatile int failed;
 	pid_t pid;
-	char child_stack[4096];
 	struct spawn_args args;
 
 	fflush_all();
@@ -207,10 +249,7 @@ pid_t FAST_FUNC spawn(char **argv)
 	args.argv = argv;
 	args.failed = &failed;
 	
-	pid = clone(spawn_child_func, 
-		child_stack + sizeof(child_stack),
-		CLONE_VM | CLONE_VFORK | SIGCHLD, 
-		&args);
+	pid = bb_clone(spawn_child_func, CLONE_VM | CLONE_VFORK, &args);
 
 	if (pid < 0) /* error */
 		return pid;
@@ -290,16 +329,9 @@ pid_t FAST_FUNC fork_or_rexec(char **argv)
 	/* fflush_all(); ? - so far all callers had no buffered output to flush */
 
 	{
-		char child_stack[4096];
 		struct rexec_args args = { .argv = argv };
 
-		pid = clone(rexec_child_func,
-			child_stack + sizeof(child_stack),
-			CLONE_VM | CLONE_VFORK | SIGCHLD,
-			&args);
-
-		if (pid < 0)
-			bb_simple_perror_msg_and_die("clone");
+		pid = xclone(rexec_child_func, CLONE_VM | CLONE_VFORK, &args);
 	}
 
 	/* parent */

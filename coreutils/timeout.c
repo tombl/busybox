@@ -45,7 +45,6 @@
 //usage:       "Default SIG: TERM."
 //usage:       "If it still exists in KILL_SECS seconds, send KILL.\n"
 
-#include <sched.h>   /* for clone() */
 #include "libbb.h"
 
 static NOINLINE int timeout_wait(duration_t timeout, pid_t pid)
@@ -76,7 +75,7 @@ struct child_args {
 };
 
 /* This function runs in the cloned child process */
-static int child_func(void *data)
+static int watcher_child(void *data)
 {
 	struct child_args *args = (struct child_args *)data;
 
@@ -94,6 +93,15 @@ static int child_func(void *data)
 	return EXIT_SUCCESS;
 }
 
+/* Keep the watcher out of the target's child list.  The short-lived child
+ * creates it and exits; after we reap that child, the watcher is orphaned and
+ * this process can become the requested program. */
+static int launcher_child(void *data)
+{
+	xclone(watcher_child, 0, data);
+	return EXIT_SUCCESS;
+}
+
 int timeout_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int timeout_main(int argc UNUSED_PARAM, char **argv)
 {
@@ -104,7 +112,6 @@ int timeout_main(int argc UNUSED_PARAM, char **argv)
 	pid_t pid;
 	const char *opt_s = "TERM";
 	char *opt_k = NULL;
-	char child_stack[4096];
 	struct child_args args;
 
 	/* '+': stop at first non-option */
@@ -121,7 +128,7 @@ int timeout_main(int argc UNUSED_PARAM, char **argv)
 
 	if (!argv[0])
 		bb_show_usage();
-	timeout = parse_duration_str(argv[0]++);
+	timeout = parse_duration_str(*argv++);
 	if (!argv[0]) /* no PROG? */
 		bb_show_usage();
 
@@ -133,21 +140,9 @@ int timeout_main(int argc UNUSED_PARAM, char **argv)
 	args.parent_pid = parent_pid;
 	args.signo = signo;
 
-	/* Clone the child process to monitor the parent */
-	pid = clone(child_func,
-			child_stack + sizeof(child_stack),
-			CLONE_VM | SIGCHLD,
-			&args
-	);
-
-	if (pid < 0) {
-		bb_perror_msg_and_die("clone");
-	}
-
-	/* Parent continues here immediately after child exits or execs */
-	/* We removed the wait() because CLONE_VFORK suspends parent */
-	/* until child calls _exit() or execve(), and our child_func */
-	/* only calls _exit() eventually after sleeps/kills */
+	pid = xclone(launcher_child, 0, &args);
+	if (wait4pid(pid) != EXIT_SUCCESS)
+		return EXIT_FAILURE;
 
 	/* Ok, exec the program as requested */
 	BB_EXECVP_or_die(argv);

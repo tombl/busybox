@@ -76,6 +76,7 @@
 //usage:     "\n	-c DIR	Cron dir. Default:"CONFIG_FEATURE_CROND_DIR"/crontabs"
 
 #include "libbb.h"
+#include <sched.h>
 #include "common_bufsiz.h"
 #include <syslog.h>
 
@@ -692,6 +693,34 @@ static void change_user(struct passwd *pas)
 // TODO: sendmail should be _run-time_ option, not compile-time!
 #if ENABLE_FEATURE_CROND_CALL_SENDMAIL
 
+struct cron_job_args {
+	const char *user;
+	int mail_fd;
+	CronLine *line;
+	struct passwd *passwd;
+	const char *program;
+	bool run_sendmail;
+};
+
+static int cron_job_child(void *data)
+{
+	struct cron_job_args *args = data;
+
+	change_user(args->passwd);
+	log5("child running %s", args->program);
+	if (args->mail_fd >= 0) {
+		xmove_fd(args->mail_fd, args->run_sendmail ? STDIN_FILENO : STDOUT_FILENO);
+		dup2(STDOUT_FILENO, STDERR_FILENO);
+	}
+	bb_setpgrp();
+	if (!args->run_sendmail)
+		execlp(args->program, args->program, "-c", args->line->cl_cmd, (char *) NULL);
+	else
+		execlp(args->program, args->program, SENDMAIL_ARGS, (char *) NULL);
+	logmode |= LOGMODE_STDIO;
+	bb_error_msg_and_die("can't execute '%s' for user %s", args->program, args->user);
+}
+
 static pid_t
 fork_job(const char *user, int mailFd, CronLine *line, bool run_sendmail)
 {
@@ -699,6 +728,7 @@ fork_job(const char *user, int mailFd, CronLine *line, bool run_sendmail)
 	const char *shell, *prog;
 	smallint sv_logmode;
 	pid_t pid;
+	struct cron_job_args args;
 
 	/* prepare things before vfork */
 	pas = getpwnam(user);
@@ -713,29 +743,13 @@ fork_job(const char *user, int mailFd, CronLine *line, bool run_sendmail)
 	set_env_vars(pas, shell, NULL); /* don't use crontab's PATH for sendmail */
 
 	sv_logmode = logmode;
-	pid = vfork();
-	if (pid == 0) {
-		/* CHILD */
-		/* initgroups, setgid, setuid, and chdir to home or CRON_DIR */
-		change_user(pas);
-		log5("child running %s", prog);
-		if (mailFd >= 0) {
-			xmove_fd(mailFd, run_sendmail ? 0 : 1);
-			dup2(1, 2);
-		}
-		/* crond 3.0pl1-100 puts tasks in separate process groups */
-		bb_setpgrp();
-		if (!run_sendmail)
-			execlp(prog, prog, "-c", line->cl_cmd, (char *) NULL);
-		else
-			execlp(prog, prog, SENDMAIL_ARGS, (char *) NULL);
-		/*
-		 * I want this error message on stderr too,
-		 * even if other messages go only to syslog:
-		 */
-		logmode |= LOGMODE_STDIO;
-		bb_error_msg_and_die("can't execute '%s' for user %s", prog, user);
-	}
+	args.user = user;
+	args.mail_fd = mailFd;
+	args.line = line;
+	args.passwd = pas;
+	args.program = prog;
+	args.run_sendmail = run_sendmail;
+	pid = bb_clone(cron_job_child, CLONE_VM | CLONE_VFORK, &args);
 	logmode = sv_logmode;
 
 	if (pid < 0) {
@@ -840,11 +854,30 @@ static void process_finished_job(const char *user, CronLine *line)
 
 #else /* !ENABLE_FEATURE_CROND_CALL_SENDMAIL */
 
+struct cron_job_args {
+	const char *user;
+	CronLine *line;
+	struct passwd *passwd;
+	const char *shell;
+};
+
+static int cron_job_child(void *data)
+{
+	struct cron_job_args *args = data;
+
+	change_user(args->passwd);
+	log5("child running %s", args->shell);
+	bb_setpgrp();
+	execl(args->shell, args->shell, "-c", args->line->cl_cmd, (char *) NULL);
+	bb_error_msg_and_die("can't execute '%s' for user %s", args->shell, args->user);
+}
+
 static pid_t start_one_job(const char *user, CronLine *line)
 {
 	const char *shell;
 	struct passwd *pas;
 	pid_t pid;
+	struct cron_job_args args;
 
 	pas = getpwnam(user);
 	if (!pas) {
@@ -857,17 +890,11 @@ static pid_t start_one_job(const char *user, CronLine *line)
 	set_env_vars(pas, shell, line->cl_path);
 
 	/* Fork as the user in question and run program */
-	pid = vfork();
-	if (pid == 0) {
-		/* CHILD */
-		/* initgroups, setgid, setuid, and chdir to home or CRON_DIR */
-		change_user(pas);
-		log5("child running %s", shell);
-		/* crond 3.0pl1-100 puts tasks in separate process groups */
-		bb_setpgrp();
-		execl(shell, shell, "-c", line->cl_cmd, (char *) NULL);
-		bb_error_msg_and_die("can't execute '%s' for user %s", shell, user);
-	}
+	args.user = user;
+	args.line = line;
+	args.passwd = pas;
+	args.shell = shell;
+	pid = bb_clone(cron_job_child, CLONE_VM | CLONE_VFORK, &args);
 	if (pid < 0) {
 		bb_simple_perror_msg("vfork");
  err:

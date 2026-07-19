@@ -116,7 +116,7 @@
 //kbuild:lib-$(CONFIG_TAR) += tar.o
 
 #include <fnmatch.h>
-#include <sched.h>   /* for clone() */
+#include <sched.h>
 #include "libbb.h"
 #include "common_bufsiz.h"
 #include "bb_archive.h"
@@ -618,9 +618,7 @@ static int compressor_child_func(void *data)
 
 static void clone_compressor(int tar_fd, const char *gzip)
 {
-	char child_stack[4096];
 	volatile int clone_exec_errno = 0;
-	pid_t pid;
 	struct compressor_info info;
 
 	xpiped_pair(info.data);
@@ -632,14 +630,7 @@ static void clone_compressor(int tar_fd, const char *gzip)
 	info.gzip = gzip;
 	info.exec_err = &clone_exec_errno;
 
-	pid = clone(compressor_child_func,
-		child_stack + sizeof(child_stack),
-		CLONE_VM | CLONE_VFORK | SIGCHLD,
-		&info
-	);
-
-	if (pid < 0)
-		bb_perror_msg_and_die("clone");
+	xclone(compressor_child_func, CLONE_VM | CLONE_VFORK, &info);
 
 	/* parent */
 	xmove_fd(info.data.wr, tar_fd);

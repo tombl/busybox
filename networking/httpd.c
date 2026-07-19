@@ -292,6 +292,7 @@
 
 #include "libbb.h"
 #include "common_bufsiz.h"
+#include <sched.h>
 #if ENABLE_PAM
 /* PAM may include <locale.h>. We may need to undefine bbox's stub define: */
 # undef setlocale
@@ -1529,6 +1530,59 @@ static void setenv1(const char *name, const char *value)
 	setenv(name, value ? value : "", 1);
 }
 
+struct cgi_child_args {
+	struct fd_pair from_cgi;
+	struct fd_pair to_cgi;
+	char *url;
+	char *last_slash;
+};
+
+static int cgi_child(void *data)
+{
+	struct cgi_child_args *args = data;
+	char *script;
+	char *argv[3];
+
+	xfunc_error_retval = 242;
+	close(args->to_cgi.wr);
+	close(args->from_cgi.rd);
+	xmove_fd(args->to_cgi.rd, STDIN_FILENO);
+	xmove_fd(args->from_cgi.wr, STDOUT_FILENO);
+
+	script = args->last_slash;
+	if (script != args->url) {
+		*script = '\0';
+		if (chdir_or_warn(args->url + 1) != 0)
+			goto error_execing_cgi;
+	}
+	script++;
+	argv[0] = script;
+	argv[1] = NULL;
+
+#if ENABLE_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR
+	{
+		char *suffix = strrchr(script, '.');
+		if (suffix) {
+			Htaccess *cur;
+			for (cur = script_i; cur; cur = cur->next) {
+				if (strcmp(cur->before_colon + 1, suffix) == 0) {
+					argv[0] = cur->after_colon;
+					argv[1] = script;
+					argv[2] = NULL;
+					break;
+				}
+			}
+		}
+	}
+#endif
+	bb_signals((1 << SIGCHLD) | (1 << SIGPIPE) | (1 << SIGHUP), SIG_DFL);
+	execv(argv[0], argv);
+	if (verbose)
+		bb_perror_msg("can't execute '%s'", argv[0]);
+ error_execing_cgi:
+	send_headers_and_exit(HTTP_NOT_FOUND);
+}
+
 /*
  * Spawn CGI script, forward CGI's stdin/out <=> network
  *
@@ -1554,6 +1608,7 @@ static void send_cgi_and_exit(
 {
 	struct fd_pair fromCgi;  /* CGI -> httpd pipe */
 	struct fd_pair toCgi;    /* httpd -> CGI pipe */
+	struct cgi_child_args child_args;
 	char *script, *last_slash;
 	int pid;
 
@@ -1642,78 +1697,15 @@ static void send_cgi_and_exit(
 	xpiped_pair(fromCgi);
 	xpiped_pair(toCgi);
 
-	pid = vfork();
+	child_args.from_cgi = fromCgi;
+	child_args.to_cgi = toCgi;
+	child_args.url = (char *) url;
+	child_args.last_slash = last_slash;
+	pid = bb_clone(cgi_child, CLONE_VM | CLONE_VFORK, &child_args);
 	if (pid < 0) {
 		/* TODO: log perror? */
 		log_and_exit();
 	}
-
-	if (pid == 0) {
-		/* Child process */
-		char *argv[3];
-
-		xfunc_error_retval = 242;
-
-		/* NB: close _first_, then move fds! */
-		close(toCgi.wr);
-		close(fromCgi.rd);
-		xmove_fd(toCgi.rd, 0);  /* replace stdin with the pipe */
-		xmove_fd(fromCgi.wr, 1);  /* replace stdout with the pipe */
-		/* User seeing stderr output can be a security problem.
-		 * If CGI really wants that, it can always do dup itself. */
-		/* dup2(1, 2); */
-
-		/* Chdiring to script's dir */
-		script = last_slash;
-		if (script != url) { /* paranoia */
-			*script = '\0';
-			if (chdir_or_warn(url + 1) != 0) {
-				goto error_execing_cgi;
-			}
-			// not needed: *script = '/';
-		}
-		script++;
-
-		/* set argv[0] to name without path */
-		argv[0] = script;
-		argv[1] = NULL;
-
-#if ENABLE_FEATURE_HTTPD_CONFIG_WITH_SCRIPT_INTERPR
-		{
-			char *suffix = strrchr(script, '.');
-
-			if (suffix) {
-				Htaccess *cur;
-				for (cur = script_i; cur; cur = cur->next) {
-					if (strcmp(cur->before_colon + 1, suffix) == 0) {
-						/* found interpreter name */
-						argv[0] = cur->after_colon;
-						argv[1] = script;
-						argv[2] = NULL;
-						break;
-					}
-				}
-			}
-		}
-#endif
-		/* restore default signal dispositions for CGI process */
-		bb_signals(0
-			| (1 << SIGCHLD)
-			| (1 << SIGPIPE)
-			| (1 << SIGHUP)
-			, SIG_DFL);
-
-		/* _NOT_ execvp. We do not search PATH. argv[0] is a filename
-		 * without any dir components and will only match a file
-		 * in the current directory */
-		execv(argv[0], argv);
-		if (verbose)
-			bb_perror_msg("can't execute '%s'", argv[0]);
- error_execing_cgi:
-		/* send to stdout
-		 * (we are CGI here, our stdout is pumped to the net) */
-		send_headers_and_exit(HTTP_NOT_FOUND);
-	} /* end child */
 
 	/* Parent process */
 
@@ -2632,7 +2624,23 @@ static void handle_incoming_and_exit(const len_and_sockaddr *fromAddr)
  * the processing as a [v]forked process.
  * Never returns.
  */
-#if BB_MMU
+struct httpd_child_args {
+	int server_socket;
+	int connection_fd;
+	len_and_sockaddr from_addr;
+};
+
+static int httpd_child(void *data)
+{
+	struct httpd_child_args *args = data;
+
+	signal(SIGHUP, SIG_IGN);
+	close(args->server_socket);
+	xmove_fd(args->connection_fd, STDIN_FILENO);
+	xdup2(STDIN_FILENO, STDOUT_FILENO);
+	handle_incoming_and_exit(&args->from_addr);
+}
+
 static void mini_httpd(int server_socket) NORETURN;
 static void mini_httpd(int server_socket)
 {
@@ -2644,6 +2652,7 @@ static void mini_httpd(int server_socket)
 	while (1) {
 		int n;
 		len_and_sockaddr fromAddr;
+		struct httpd_child_args args;
 
 		/* Wait for connections... */
 		fromAddr.len = LSA_SIZEOF_SA;
@@ -2661,65 +2670,15 @@ static void mini_httpd(int server_socket)
 		/* set the KEEPALIVE option to cull dead connections */
 		setsockopt_keepalive(n);
 
-		if (fork() == 0) {
-			/* child */
-			/* Do not reload config on HUP */
-			signal(SIGHUP, SIG_IGN);
-			close(server_socket);
-			xmove_fd(n, 0);
-			xdup2(0, 1);
-
-			handle_incoming_and_exit(&fromAddr);
-		}
+		args.server_socket = server_socket;
+		args.connection_fd = n;
+		args.from_addr = fromAddr;
+		bb_clone(httpd_child, 0, &args);
 		/* parent, or fork failed */
 		close(n);
 	} /* while (1) */
 	/* never reached */
 }
-#else
-static void mini_httpd_nommu(int server_socket, int argc, char **argv) NORETURN;
-static void mini_httpd_nommu(int server_socket, int argc, char **argv)
-{
-	char *argv_copy[argc + 2];
-
-	argv_copy[0] = argv[0];
-	argv_copy[1] = (char*)"-i";
-	memcpy(&argv_copy[2], &argv[1], argc * sizeof(argv[0]));
-
-	/* NB: it's best to not use xfuncs in this loop before vfork().
-	 * Otherwise server may die on transient errors (temporary
-	 * out-of-memory condition, etc), which is Bad(tm).
-	 * Try to do any dangerous calls after fork.
-	 */
-	while (1) {
-		int n;
-
-		/* Wait for connections... */
-		n = accept(server_socket, NULL, NULL);
-		if (n < 0)
-			continue;
-
-		/* set the KEEPALIVE option to cull dead connections */
-		setsockopt_keepalive(n);
-
-		if (vfork() == 0) {
-			/* child */
-			/* Do not reload config on HUP */
-			signal(SIGHUP, SIG_IGN);
-			close(server_socket);
-			xmove_fd(n, 0);
-			xdup2(0, 1);
-
-			/* Run a copy of ourself in inetd mode */
-			re_exec(argv_copy);
-		}
-		/* parent, or vfork failed */
-		argv_copy[0][0] &= 0x7f; /* undo re_rexec() damage */
-		close(n);
-	} /* while (1) */
-	/* never reached */
-}
-#endif
 
 /*
  * Process a HTTP connection on stdin/out.
@@ -2844,7 +2803,7 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 	}
 #endif
 	/* Chdir to home (unless we were re_exec()ed for NOMMU case
-	 * in mini_httpd_nommu(): we are already in the home dir then).
+	 * in mini_httpd(): we are already in the home dir then).
 	 */
 	if (!re_execed)
 		xchdir(home_httpd);
@@ -2893,9 +2852,7 @@ int httpd_main(int argc UNUSED_PARAM, char **argv)
 #if BB_MMU
 	if (!(opt & OPT_FOREGROUND))
 		bb_daemonize(0); /* don't change current directory */
-	mini_httpd(server_socket); /* never returns */
-#else
-	mini_httpd_nommu(server_socket, argc, argv); /* never returns */
 #endif
+	mini_httpd(server_socket); /* never returns */
 	/* return 0; */
 }

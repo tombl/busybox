@@ -187,6 +187,42 @@ static void mount_namespaces(pid_t pid, struct namespace_ctx *ns_ctx_list)
 	}
 }
 
+struct unshare_child_args {
+	unsigned opts;
+	uid_t reuid;
+	gid_t regid;
+	const char *setgrp_str;
+	unsigned long prop_flags;
+	const char *proc_mnt_target;
+	char **argv;
+};
+
+static int unshare_child(void *data)
+{
+	struct unshare_child_args *args = data;
+
+	if (args->opts & OPT_map_root) {
+		char uidmap_buf[sizeof("0 %u 1") + sizeof(int)*3];
+
+		xopen_xwrite_close(PATH_PROC_SETGROUPS, "deny");
+		sprintf(uidmap_buf, "0 %u 1", (unsigned)args->reuid);
+		xopen_xwrite_close(PATH_PROC_UIDMAP, uidmap_buf);
+		sprintf(uidmap_buf, "0 %u 1", (unsigned)args->regid);
+		xopen_xwrite_close(PATH_PROC_GIDMAP, uidmap_buf);
+	} else if (args->setgrp_str) {
+		xopen_xwrite_close(PATH_PROC_SETGROUPS, args->setgrp_str);
+	}
+
+	if (args->opts & OPT_mount)
+		mount_or_die("none", "/", NULL, args->prop_flags);
+	if (args->opts & OPT_mount_proc) {
+		mount_or_die("none", args->proc_mnt_target, NULL, MS_PRIVATE | MS_REC);
+		mount_or_die("proc", args->proc_mnt_target, "proc",
+			MS_NOSUID | MS_NOEXEC | MS_NODEV);
+	}
+	exec_prog_or_SHELL(args->argv);
+}
+
 int unshare_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int unshare_main(int argc UNUSED_PARAM, char **argv)
 {
@@ -203,6 +239,7 @@ int unshare_main(int argc UNUSED_PARAM, char **argv)
 	struct fd_pair fdp;
 	pid_t child = child; /* for compiler */
 	struct namespace_ctx ns_ctx_list[NS_COUNT];
+	struct unshare_child_args child_args;
 
 	memset(ns_ctx_list, 0, sizeof(ns_ctx_list));
 	proc_mnt_target = "/proc";
@@ -332,46 +369,14 @@ int unshare_main(int argc UNUSED_PARAM, char **argv)
 	 * child. The user may want to use this option to spawn a new process
 	 * that'll become PID 1 in this new namespace.
 	 */
-	if (opts & OPT_fork) {
-		xvfork_parent_waits_and_exits();
-		/* Child continues */
-	}
-
-	if (opts & OPT_map_root) {
-		char uidmap_buf[sizeof("0 %u 1") + sizeof(int)*3];
-
-		/*
-		 * Since Linux 3.19 unprivileged writing of /proc/self/gid_map
-		 * has been disabled unless /proc/self/setgroups is written
-		 * first to permanently disable the ability to call setgroups
-		 * in that user namespace.
-		 */
-		xopen_xwrite_close(PATH_PROC_SETGROUPS, "deny");
-		sprintf(uidmap_buf, "0 %u 1", (unsigned)reuid);
-		xopen_xwrite_close(PATH_PROC_UIDMAP, uidmap_buf);
-		sprintf(uidmap_buf, "0 %u 1", (unsigned)regid);
-		xopen_xwrite_close(PATH_PROC_GIDMAP, uidmap_buf);
-	} else
-	if (setgrp_str) {
-		/* Write "allow" or "deny" */
-		xopen_xwrite_close(PATH_PROC_SETGROUPS, setgrp_str);
-	}
-
-	if (opts & OPT_mount) {
-		mount_or_die("none", "/", NULL, prop_flags);
-	}
-
-	if (opts & OPT_mount_proc) {
-		/*
-		 * When creating a new pid namespace, we might want the pid
-		 * subdirectories in /proc to remain consistent with the new
-		 * process IDs. Without --mount-proc the pids in /proc would
-		 * still reflect the old pid namespace. This is why we make
-		 * /proc private here and then do a fresh mount.
-		 */
-		mount_or_die("none", proc_mnt_target, NULL, MS_PRIVATE | MS_REC);
-		mount_or_die("proc", proc_mnt_target, "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV);
-	}
-
-	exec_prog_or_SHELL(argv);
+	child_args.opts = opts;
+	child_args.reuid = reuid;
+	child_args.regid = regid;
+	child_args.setgrp_str = setgrp_str;
+	child_args.prop_flags = prop_flags;
+	child_args.proc_mnt_target = proc_mnt_target;
+	child_args.argv = argv;
+	if (opts & OPT_fork)
+		bb_clone_parent_waits_and_exits(unshare_child, &child_args);
+	return unshare_child(&child_args);
 }

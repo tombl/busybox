@@ -169,6 +169,7 @@
 //usage:     "\n	-Y on/off	Use proxy"
 
 #include "libbb.h"
+#include <sched.h>
 
 #if 0
 # define log_io(...) bb_error_msg(__VA_ARGS__)
@@ -675,12 +676,64 @@ static void reset_beg_range_to_zero(void)
 }
 
 #if ENABLE_FEATURE_WGET_OPENSSL
+struct openssl_child_args {
+	const char *host;
+	const char *servername;
+	int socket_fd[2];
+	IF_FEATURE_WGET_HTTPS(volatile int *child_failed;)
+};
+
+static int openssl_child(void *data)
+{
+	struct openssl_child_args *args = data;
+	char *argv[13];
+	char **argp;
+
+	close(args->socket_fd[0]);
+	xmove_fd(args->socket_fd[1], 0);
+	xdup2(0, 1);
+	xmove_fd(2, 3);
+	xopen("/dev/null", O_RDWR);
+	memset(&argv, 0, sizeof(argv));
+	argv[0] = (char*)"openssl";
+	argv[1] = (char*)"s_client";
+	argv[2] = (char*)"-quiet";
+	argv[3] = (char*)"-connect";
+	argv[4] = (char*)args->host;
+	argp = &argv[5];
+	if (!is_ip_address(args->servername)) {
+		*argp++ = (char*)"-servername";
+		*argp++ = (char*)args->servername;
+	}
+	if (!(option_mask32 & WGET_OPT_NO_CHECK_CERT)) {
+		*argp++ = (char*)"-verify";
+		*argp++ = (char*)"100";
+		*argp++ = (char*)"-verify_return_error";
+		if (!is_ip_address(args->servername)) {
+			*argp++ = (char*)"-verify_hostname";
+			*argp++ = (char*)args->servername;
+		} else {
+			*argp++ = (char*)"-verify_ip";
+			*argp++ = (char*)args->host;
+		}
+	}
+
+	BB_EXECVP(argv[0], argv);
+	xmove_fd(3, 2);
+# if ENABLE_FEATURE_WGET_HTTPS
+	*args->child_failed = 1;
+	xfunc_die();
+# else
+	bb_perror_msg_and_die("can't execute '%s'", argv[0]);
+# endif
+}
+
 static int spawn_https_helper_openssl(const char *host, unsigned port)
 {
 	char *allocated = NULL;
 	char *servername;
 	int sp[2];
-	int pid;
+	struct openssl_child_args args;
 	IF_FEATURE_WGET_HTTPS(volatile int child_failed = 0;)
 
 	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0)
@@ -693,63 +746,12 @@ static int spawn_https_helper_openssl(const char *host, unsigned port)
 	strrchr(servername, ':')[0] = '\0';
 
 	fflush_all();
-	pid = xvfork();
-	if (pid == 0) {
-		/* Child */
-		char *argv[13];
-		char **argp;
-
-		close(sp[0]);
-		xmove_fd(sp[1], 0);
-		xdup2(0, 1);
-		/*
-		 * openssl s_client -quiet -connect www.kernel.org:443 2>/dev/null
-		 * It prints some debug stuff on stderr, don't know how to suppress it.
-		 * Work around by dev-nulling stderr. We lose all error messages :(
-		 */
-		xmove_fd(2, 3);
-		xopen("/dev/null", O_RDWR);
-		memset(&argv, 0, sizeof(argv));
-		argv[0] = (char*)"openssl";
-		argv[1] = (char*)"s_client";
-		argv[2] = (char*)"-quiet";
-		argv[3] = (char*)"-connect";
-		argv[4] = (char*)host;
-		/*
-		 * Per RFC 6066 Section 3, the only permitted values in the
-		 * TLS server_name (SNI) field are FQDNs (DNS hostnames).
-		 * IPv4 and IPv6 addresses, port numbers are not allowed.
-		 */
-		argp = &argv[5];
-		if (!is_ip_address(servername)) {
-			*argp++ = (char*)"-servername"; //[5]
-			*argp++ = (char*)servername;    //[6]
-		}
-		if (!(option_mask32 & WGET_OPT_NO_CHECK_CERT)) {
-			/* Abort on bad server certificate */
-			*argp++ = (char*)"-verify";              //[7]
-			*argp++ = (char*)"100";                  //[8]
-			*argp++ = (char*)"-verify_return_error"; //[9]
-			if (!is_ip_address(servername)) {
-				*argp++ = (char*)"-verify_hostname"; //[10]
-				*argp++ = (char*)servername;         //[11]
-			} else {
-				*argp++ = (char*)"-verify_ip"; //[10]
-				*argp++ = (char*)host;         //[11]
-			}
-		}
-		//[12] (or earlier) is NULL terminator
-
-		BB_EXECVP(argv[0], argv);
-		xmove_fd(3, 2);
-# if ENABLE_FEATURE_WGET_HTTPS
-		child_failed = 1;
-		xfunc_die();
-# else
-		bb_perror_msg_and_die("can't execute '%s'", argv[0]);
-# endif
-		/* notreached */
-	}
+	args.host = host;
+	args.servername = servername;
+	args.socket_fd[0] = sp[0];
+	args.socket_fd[1] = sp[1];
+	IF_FEATURE_WGET_HTTPS(args.child_failed = &child_failed;)
+	xclone(openssl_child, CLONE_VM | CLONE_VFORK, &args);
 
 	/* Parent */
 	free(servername);
@@ -766,11 +768,46 @@ static int spawn_https_helper_openssl(const char *host, unsigned port)
 #endif
 
 #if ENABLE_FEATURE_WGET_HTTPS
+struct ssl_client_args {
+	const char *servername;
+	int network_fd;
+	int socket_fd[2];
+	int flags;
+};
+
+static int ssl_client_child(void *data)
+{
+	struct ssl_client_args *args = data;
+
+	close(args->socket_fd[0]);
+	xmove_fd(args->socket_fd[1], 0);
+	xdup2(0, 1);
+	if (BB_MMU) {
+		tls_state_t *tls = new_tls_state();
+		tls->ifd = tls->ofd = args->network_fd;
+		tls_handshake(tls, args->servername);
+		tls_run_copy_loop(tls, args->flags);
+		return 0;
+	} else {
+		char *argv[6];
+
+		xmove_fd(args->network_fd, 3);
+		argv[0] = (char*)"ssl_client";
+		argv[1] = (char*)"-s3";
+		argv[2] = (char*)"-n";
+		argv[3] = (char*)args->servername;
+		argv[4] = (args->flags & TLSLOOP_EXIT_ON_LOCAL_EOF ? (char*)"-e" : NULL);
+		argv[5] = NULL;
+		BB_EXECVP(argv[0], argv);
+		bb_perror_msg_and_die("can't execute '%s'", argv[0]);
+	}
+}
+
 static void spawn_ssl_client(const char *host, int network_fd, int flags)
 {
 	int sp[2];
-	int pid;
 	char *servername, *p;
+	struct ssl_client_args args;
 
 	if (!(option_mask32 & WGET_OPT_NO_CHECK_CERT)) {
 		option_mask32 |= WGET_OPT_NO_CHECK_CERT;
@@ -786,34 +823,12 @@ static void spawn_ssl_client(const char *host, int network_fd, int flags)
 		bb_simple_perror_msg_and_die("socketpair");
 
 	fflush_all();
-	pid = BB_MMU ? xfork() : xvfork();
-	if (pid == 0) {
-		/* Child */
-		close(sp[0]);
-		xmove_fd(sp[1], 0);
-		xdup2(0, 1);
-		if (BB_MMU) {
-			tls_state_t *tls = new_tls_state();
-			tls->ifd = tls->ofd = network_fd;
-			tls_handshake(tls, servername);
-			tls_run_copy_loop(tls, flags);
-			exit(0);
-		} else {
-			char *argv[6];
-
-			xmove_fd(network_fd, 3);
-			argv[0] = (char*)"ssl_client";
-			argv[1] = (char*)"-s3";
-			//TODO: if (!is_ip_address(servername))...
-			argv[2] = (char*)"-n";
-			argv[3] = servername;
-			argv[4] = (flags & TLSLOOP_EXIT_ON_LOCAL_EOF ? (char*)"-e" : NULL);
-			argv[5] = NULL;
-			BB_EXECVP(argv[0], argv);
-			bb_perror_msg_and_die("can't execute '%s'", argv[0]);
-		}
-		/* notreached */
-	}
+	args.servername = servername;
+	args.network_fd = network_fd;
+	args.socket_fd[0] = sp[0];
+	args.socket_fd[1] = sp[1];
+	args.flags = flags;
+	xclone(ssl_client_child, 0, &args);
 
 	/* Parent */
 	free(servername);

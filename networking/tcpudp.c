@@ -161,16 +161,6 @@ static void xsetenv_proto(const char *proto, const char *n, const char *v)
 	putenv(var);
 }
 
-static void undo_xsetenv(void)
-{
-	char **pp = env_cur = &env_var[0];
-	while (*pp) {
-		char *var = *pp;
-		bb_unsetenv_and_free(var);
-		*pp++ = NULL;
-	}
-}
-
 static void sig_term_handler(int sig)
 {
 	if (verbose)
@@ -248,6 +238,100 @@ static void sig_child_handler(int sig UNUSED_PARAM)
 	errno = sv_errno;
 }
 
+struct tcpudp_child_args {
+	bool tcp;
+	unsigned opts;
+	char *preset_local_hostname;
+	char *remote_addr;
+	char *remote_hostname;
+	len_and_sockaddr local;
+	len_and_sockaddr remote;
+	char **argv;
+};
+
+static int tcpudp_child(void *data)
+{
+	struct tcpudp_child_args *args = data;
+	char *local_hostname = NULL;
+	char *local_addr = NULL;
+	char *free_me0 = NULL;
+	char *free_me1 = NULL;
+	char *free_me2 = NULL;
+	char *remote_addr = args->remote_addr;
+	char *remote_hostname = args->remote_hostname;
+	pid_t pid;
+
+	if (verbose || !(args->opts & OPT_E)) {
+		if (!max_per_host)
+			free_me0 = remote_addr = xmalloc_sockaddr2dotted(&args->remote.u.sa);
+		if (args->opts & OPT_h) {
+			free_me1 = remote_hostname = xmalloc_sockaddr2host_noport(&args->remote.u.sa);
+			if (!remote_hostname) {
+				bb_error_msg("can't look up hostname for %s", remote_addr);
+				remote_hostname = remote_addr;
+			}
+		}
+		if (args->tcp)
+			getsockname(STDIN_FILENO, &args->local.u.sa, &args->local.len);
+		local_addr = xmalloc_sockaddr2dotted(&args->local.u.sa);
+		if (args->opts & OPT_h) {
+			local_hostname = args->preset_local_hostname;
+			if (!local_hostname) {
+				free_me2 = local_hostname = xmalloc_sockaddr2host_noport(&args->local.u.sa);
+				if (!local_hostname)
+					bb_error_msg_and_die("can't look up hostname for %s", local_addr);
+			}
+		}
+	}
+	if (verbose) {
+		pid = getpid();
+		if (max_per_host) {
+			bb_error_msg("concurrency %s %u/%u",
+				remote_addr, cur_per_host, max_per_host);
+		}
+		bb_error_msg((args->opts & OPT_h)
+			? "start %u %s-%s (%s-%s)"
+			: "start %u %s-%s",
+			pid, local_addr, remote_addr, local_hostname, remote_hostname);
+	}
+
+	if (!(args->opts & OPT_E)) {
+		const char *proto = args->tcp ? "TCP" : "UDP";
+#ifdef SO_ORIGINAL_DST
+		if (args->tcp && getsockopt(STDIN_FILENO, SOL_IP, SO_ORIGINAL_DST,
+				&args->local.u.sa, &args->local.len) == 0) {
+			char *addr = xmalloc_sockaddr2dotted(&args->local.u.sa);
+			xsetenv_plain("TCPORIGDSTADDR", addr);
+			free(addr);
+		}
+#endif
+		xsetenv_plain("PROTO", proto);
+		xsetenv_proto(proto, "LOCALADDR", local_addr);
+		xsetenv_proto(proto, "REMOTEADDR", remote_addr);
+		if (args->opts & OPT_h) {
+			xsetenv_proto(proto, "LOCALHOST", local_hostname);
+			xsetenv_proto(proto, "REMOTEHOST", remote_hostname);
+		}
+		if (cur_per_host > 0)
+			xsetenv_plain("TCPCONCURRENCY", utoa(cur_per_host));
+	}
+	free(local_addr);
+	free(free_me0);
+	free(free_me1);
+	free(free_me2);
+
+	xdup2(STDIN_FILENO, STDOUT_FILENO);
+	signal(SIGPIPE, SIG_DFL);
+	sig_unblock(SIGCHLD);
+#ifdef SSLSVD
+	strcpy(id, utoa(getpid()));
+	ssl_io(STDIN_FILENO, args->argv);
+	bb_perror_msg_and_die("can't execute '%s'", args->argv[0]);
+#else
+	BB_EXECVP_or_die(args->argv);
+#endif
+}
+
 int tcpudpsvd_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int tcpudpsvd_main(int argc UNUSED_PARAM, char **argv)
 {
@@ -256,15 +340,15 @@ int tcpudpsvd_main(int argc UNUSED_PARAM, char **argv)
 	struct hcc *hccp;
 	const char *instructs;
 	char *msg_per_host = NULL;
-	unsigned len_per_host = len_per_host; /* gcc */
+	unsigned len_per_host = 0;
 #ifndef SSLSVD
 	struct bb_uidgid_t ugid;
 #endif
 	bool tcp;
 	uint16_t local_port;
 	char *preset_local_hostname = NULL;
-	char *remote_hostname = remote_hostname; /* for compiler */
-	char *remote_addr = remote_addr; /* for compiler */
+	char *remote_hostname = NULL;
+	char *remote_addr = NULL;
 	len_and_sockaddr *lsa;
 	len_and_sockaddr local, remote;
 	socklen_t sa_len;
@@ -490,127 +574,29 @@ int tcpudpsvd_main(int argc UNUSED_PARAM, char **argv)
 #endif
 	}
 
-	pid = vfork();
+	{
+		struct tcpudp_child_args child_args;
+
+		child_args.tcp = tcp;
+		child_args.opts = opts;
+		child_args.preset_local_hostname = preset_local_hostname;
+		child_args.remote_addr = remote_addr;
+		child_args.remote_hostname = remote_hostname;
+		child_args.local = local;
+		child_args.remote = remote;
+		child_args.argv = argv;
+		pid = bb_clone(tcpudp_child, 0, &child_args);
+	}
 	if (pid == -1) {
-		bb_simple_perror_msg("vfork");
+		bb_simple_perror_msg("clone");
 		goto again;
 	}
 
-	if (pid != 0) {
-		/* Parent */
-		cnum++;
-		if_verbose_print_connection_status();
-		if (hccp)
-			hccp->pid = pid;
-		/* clean up changes done by vforked child */
-		undo_xsetenv();
-		goto again;
-	}
-
-	/* Child: prepare env, log, and exec prog */
-
-	{ /* vfork alert! every xmalloc in this block should be freed! */
-		char *local_hostname = local_hostname; /* for compiler */
-		char *local_addr = NULL;
-		char *free_me0 = NULL;
-		char *free_me1 = NULL;
-		char *free_me2 = NULL;
-
-		if (verbose || !(opts & OPT_E)) {
-			if (!max_per_host) /* remote_addr is not yet known */
-				free_me0 = remote_addr = xmalloc_sockaddr2dotted(&remote.u.sa);
-			if (opts & OPT_h) {
-				free_me1 = remote_hostname = xmalloc_sockaddr2host_noport(&remote.u.sa);
-				if (!remote_hostname) {
-					bb_error_msg("can't look up hostname for %s", remote_addr);
-					remote_hostname = remote_addr;
-				}
-			}
-			/* Find out local IP peer connected to.
-			 * Errors ignored (I'm not paranoid enough to imagine kernel
-			 * which doesn't know local IP). */
-			if (tcp)
-				getsockname(0, &local.u.sa, &local.len);
-			/* else: for UDP it is done earlier by parent */
-			local_addr = xmalloc_sockaddr2dotted(&local.u.sa);
-			if (opts & OPT_h) {
-				local_hostname = preset_local_hostname;
-				if (!local_hostname) {
-					free_me2 = local_hostname = xmalloc_sockaddr2host_noport(&local.u.sa);
-					if (!local_hostname)
-						bb_error_msg_and_die("can't look up hostname for %s", local_addr);
-				}
-				/* else: local_hostname is not NULL, but is NOT malloced! */
-			}
-		}
-		if (verbose) {
-			pid = getpid();
-			if (max_per_host) {
-				bb_error_msg("concurrency %s %u/%u",
-					remote_addr,
-					cur_per_host, max_per_host);
-			}
-			bb_error_msg((opts & OPT_h)
-				? "start %u %s-%s (%s-%s)"
-				: "start %u %s-%s",
-				pid,
-				local_addr, remote_addr,
-				local_hostname, remote_hostname);
-		}
-
-		if (!(opts & OPT_E)) {
-			/* setup ucspi env */
-			const char *proto = tcp ? "TCP" : "UDP";
-
-#ifdef SO_ORIGINAL_DST
-			/* Extract "original" destination addr:port
-			 * from Linux firewall. Useful when you redirect
-			 * an outbond connection to local handler, and it needs
-			 * to know where it originally tried to connect */
-			if (tcp && getsockopt(0, SOL_IP, SO_ORIGINAL_DST, &local.u.sa, &local.len) == 0) {
-				char *addr = xmalloc_sockaddr2dotted(&local.u.sa);
-				xsetenv_plain("TCPORIGDSTADDR", addr);
-				free(addr);
-			}
-#endif
-			xsetenv_plain("PROTO", proto);
-			xsetenv_proto(proto, "LOCALADDR", local_addr);
-			xsetenv_proto(proto, "REMOTEADDR", remote_addr);
-			if (opts & OPT_h) {
-				xsetenv_proto(proto, "LOCALHOST", local_hostname);
-				xsetenv_proto(proto, "REMOTEHOST", remote_hostname);
-			}
-			//compat? xsetenv_proto(proto, "REMOTEINFO", "");
-			/* additional */
-			if (cur_per_host > 0) /* can not be true for udp */
-				xsetenv_plain("TCPCONCURRENCY", utoa(cur_per_host));
-		}
-		free(local_addr);
-		free(free_me0);
-		free(free_me1);
-		free(free_me2);
-	}
-
-	xdup2(0, 1);
-
-	/* Restore signal handling for the to-be-execed process */
-	signal(SIGPIPE, SIG_DFL); /* this one was SIG_IGNed */
-	/* Non-ignored signals revert to SIG_DFL on exec anyway
-	 * But we can get signals BEFORE execvp(), this is unlikely
-	 * but it would invoke sig_child_handler(), which would
-	 * check waitpid(WNOHANG), then print "status N/M" if verbose.
-	 * I guess we can live with that possibility.
-	 */
-	/*signal(SIGCHLD, SIG_DFL);*/
-	sig_unblock(SIGCHLD);
-
-#ifdef SSLSVD
-	strcpy(id, utoa(pid));
-	ssl_io(0, argv);
-	bb_perror_msg_and_die("can't execute '%s'", argv[0]);
-#else
-	BB_EXECVP_or_die(argv);
-#endif
+	cnum++;
+	if_verbose_print_connection_status();
+	if (hccp)
+		hccp->pid = pid;
+	goto again;
 }
 
 /*

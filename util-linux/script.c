@@ -43,6 +43,38 @@
 
 #include "libbb.h"
 #include "common_bufsiz.h"
+#include <sched.h>
+
+struct script_child_args {
+	int pty;
+	const char *pty_line;
+	const struct termios *tt;
+	const struct winsize *win;
+	int attr_ok;
+	int winsz_ok;
+	const char *shell;
+	const char *shell_opt;
+	const char *shell_arg;
+};
+
+static int script_child(void *data)
+{
+	struct script_child_args *args = data;
+
+	close(args->pty);
+	close(STDIN_FILENO);
+	xopen(args->pty_line, O_RDWR);
+	xdup2(STDIN_FILENO, STDOUT_FILENO);
+	xdup2(STDIN_FILENO, STDERR_FILENO);
+	if (args->attr_ok == 0)
+		tcsetattr(STDIN_FILENO, TCSAFLUSH, args->tt);
+	if (args->winsz_ok == 0)
+		ioctl(STDIN_FILENO, TIOCSWINSZ, (char *) args->win);
+	setsid();
+	ioctl(STDIN_FILENO, TIOCSCTTY, 0);
+	execl(args->shell, args->shell, args->shell_opt, args->shell_arg, (char *) NULL);
+	bb_simple_perror_msg_and_die(args->shell);
+}
 
 int script_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int script_main(int argc UNUSED_PARAM, char **argv)
@@ -62,6 +94,7 @@ int script_main(int argc UNUSED_PARAM, char **argv)
 	const char *shell;
 	char shell_opt[] = "-i";
 	char *shell_arg = NULL;
+	struct script_child_args child_args;
 	enum {
 		OPT_a = (1 << 0),
 		OPT_c = (1 << 1),
@@ -130,7 +163,16 @@ int script_main(int argc UNUSED_PARAM, char **argv)
 
 	/* TODO: SIGWINCH? pass window size changes down to slave? */
 
-	child_pid = xvfork();
+	child_args.pty = pty;
+	child_args.pty_line = pty_line;
+	child_args.tt = &tt;
+	child_args.win = &win;
+	child_args.attr_ok = attr_ok;
+	child_args.winsz_ok = winsz_ok;
+	child_args.shell = shell;
+	child_args.shell_opt = shell_opt;
+	child_args.shell_arg = shell_arg;
+	child_pid = xclone(script_child, CLONE_VM | CLONE_VFORK, &child_args);
 
 	if (child_pid) {
 		/* parent */
@@ -217,24 +259,5 @@ int script_main(int argc UNUSED_PARAM, char **argv)
 		return EXIT_SUCCESS;
 	}
 
-	/* child: make pty slave to be input, output, error; run shell */
-	close(pty); /* close pty master */
-	/* open pty slave to fd 0,1,2 */
-	close(0);
-	xopen(pty_line, O_RDWR); /* uses fd 0 */
-	xdup2(0, 1);
-	xdup2(0, 2);
-	/* copy our original stdin tty's parameters to pty */
-	if (attr_ok == 0)
-		tcsetattr(0, TCSAFLUSH, &tt);
-	if (winsz_ok == 0)
-		ioctl(0, TIOCSWINSZ, (char *)&win);
-	/* set pty as a controlling tty */
-	setsid();
-	ioctl(0, TIOCSCTTY, 0 /* 0: don't forcibly steal */);
-
-	/* Non-ignored signals revert to SIG_DFL on exec anyway */
-	/*signal(SIGCHLD, SIG_DFL);*/
-	execl(shell, shell, shell_opt, shell_arg, (char *) NULL);
-	bb_simple_perror_msg_and_die(shell);
+	return EXIT_FAILURE;
 }

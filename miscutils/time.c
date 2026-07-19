@@ -32,6 +32,7 @@
 //usage:     "\n	-a	Append (else overwrite)"
 
 #include "libbb.h"
+#include <sched.h>
 
 #ifndef HAVE_WAIT3
 static pid_t wait3(int *status, int options, struct rusage *rusage)
@@ -404,6 +405,11 @@ static void summarize(const char *fmt, char **command, resource_t *resp)
  ret: ;
 }
 
+static int run_command_child(void *data)
+{
+	BB_EXECVP_or_die(data);
+}
+
 /* Run command CMD and return statistics on it.
    Put the statistics in *RESP.  */
 static void run_command(char *const *cmd, resource_t *resp)
@@ -413,11 +419,7 @@ static void run_command(char *const *cmd, resource_t *resp)
 	void (*quit_signal)(int);
 
 	resp->elapsed_ms = monotonic_ms();
-	pid = xvfork();
-	if (pid == 0) {
-		/* Child */
-		BB_EXECVP_or_die((char**)cmd);
-	}
+	pid = xclone(run_command_child, CLONE_VM | CLONE_VFORK, (char **) cmd);
 
 	/* Have signals kill the child but not self (if possible).  */
 //TODO: just block all sigs? and re-enable them in the very end in main?

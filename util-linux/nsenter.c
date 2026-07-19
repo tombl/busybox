@@ -151,6 +151,28 @@ static int open_by_path_or_target(const char *path,
 	return xopen(path, O_RDONLY);
 }
 
+struct nsenter_child_args {
+	unsigned opts;
+	int setgroups_failed;
+	gid_t gid;
+	uid_t uid;
+	char **argv;
+};
+
+static int nsenter_child(void *data)
+{
+	struct nsenter_child_args *args = data;
+
+	if (args->opts & OPT_setgid) {
+		if (setgroups(0, NULL) < 0 && args->setgroups_failed)
+			bb_simple_perror_msg_and_die("setgroups");
+		xsetgid(args->gid);
+	}
+	if (args->opts & OPT_setuid)
+		xsetuid(args->uid);
+	exec_prog_or_SHELL(args->argv);
+}
+
 int nsenter_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int nsenter_main(int argc UNUSED_PARAM, char **argv)
 {
@@ -160,6 +182,7 @@ int nsenter_main(int argc UNUSED_PARAM, char **argv)
 	const char *wd_str = NULL;
 	struct namespace_ctx ns_ctx_list[NS_COUNT];
 	int setgroups_failed;
+	struct nsenter_child_args child_args;
 	int root_fd, wd_fd;
 	int target_pid = 0;
 	int uid = 0;
@@ -250,18 +273,12 @@ int nsenter_main(int argc UNUSED_PARAM, char **argv)
 	 * Entering the pid namespace implies forking unless it's been
 	 * explicitly requested by the user not to.
 	 */
-	if (!(opts & OPT_nofork) && (opts & OPT_pid)) {
-		xvfork_parent_waits_and_exits();
-		/* Child continues */
-	}
-
-	if (opts & OPT_setgid) {
-		if (setgroups(0, NULL) < 0 && setgroups_failed)
-			bb_simple_perror_msg_and_die("setgroups");
-		xsetgid(gid);
-	}
-	if (opts & OPT_setuid)
-		xsetuid(uid);
-
-	exec_prog_or_SHELL(argv);
+	child_args.opts = opts;
+	child_args.setgroups_failed = setgroups_failed;
+	child_args.gid = gid;
+	child_args.uid = uid;
+	child_args.argv = argv;
+	if (!(opts & OPT_nofork) && (opts & OPT_pid))
+		bb_clone_parent_waits_and_exits(nsenter_child, &child_args);
+	return nsenter_child(&child_args);
 }

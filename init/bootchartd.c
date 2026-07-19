@@ -46,6 +46,7 @@
 //kbuild:lib-$(CONFIG_BOOTCHARTD) += bootchartd.o
 
 #include "libbb.h"
+#include <sched.h>
 #include "common_bufsiz.h"
 /* After libbb.h, since it needs sys/types.h on some systems */
 #include <sys/utsname.h>
@@ -342,6 +343,11 @@ static void finalize(char *tempdir, const char *prog, int process_accounting)
 //usage:     "\ninit: start background logging; stop when getty/xdm is seen (for init scripts)"
 //usage:     "\nUnder PID 1: as init, then exec $bootchart_init, /init, /sbin/init"
 
+static int bootchart_program_child(void *data)
+{
+	BB_EXECVP_or_die(data);
+}
+
 int bootchartd_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int bootchartd_main(int argc UNUSED_PARAM, char **argv)
 {
@@ -454,11 +460,9 @@ int bootchartd_main(int argc UNUSED_PARAM, char **argv)
 	}
 
 	if (cmd == CMD_START && argv[2]) { /* "start PROG ARGS" */
-		pid_t pid = xvfork();
-		if (pid == 0) { /* child */
-			argv += 2;
-			BB_EXECVP_or_die(argv);
-		}
+		pid_t pid;
+		argv += 2;
+		pid = xclone(bootchart_program_child, CLONE_VM | CLONE_VFORK, argv);
 		/* parent */
 		waitpid(pid, NULL, 0);
 		kill(logger_pid, SIGUSR1);

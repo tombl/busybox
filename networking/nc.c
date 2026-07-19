@@ -55,6 +55,7 @@
 
 #include "libbb.h"
 #include "common_bufsiz.h"
+#include <sched.h>
 #if ENABLE_NC_110_COMPAT
 # include "nc_bloaty.c"
 #else
@@ -113,6 +114,21 @@
 static void timeout(int signum UNUSED_PARAM)
 {
 	bb_simple_error_msg_and_die("timed out");
+}
+
+struct nc_exec_args {
+	int connection_fd;
+	char **argv;
+};
+
+static int nc_exec_child(void *data)
+{
+	struct nc_exec_args *args = data;
+
+	xmove_fd(args->connection_fd, STDIN_FILENO);
+	xdup2(STDIN_FILENO, STDOUT_FILENO);
+	BB_EXECVP(args->argv[0], args->argv);
+	bb_perror_msg_and_die("can't execute '%s'", args->argv[0]);
 }
 
 int nc_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
@@ -228,9 +244,14 @@ int nc_main(int argc, char **argv)
 
 	/* -e given? */
 	if (execparam) {
-		pid_t pid;
 		/* With more than one -l, repeatedly act as server */
-		if (do_listen > 1 && (pid = xvfork()) != 0) {
+		if (do_listen > 1) {
+			struct nc_exec_args args = {
+				.connection_fd = cfd,
+				.argv = execparam,
+			};
+
+			xclone(nc_exec_child, CLONE_VM | CLONE_VFORK, &args);
 			/* parent */
 			/* prevent zombies */
 			signal(SIGCHLD, SIG_IGN);

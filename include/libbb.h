@@ -1257,7 +1257,9 @@ void BB_EXECVP_or_die(char **argv) NORETURN FAST_FUNC;
 #if BB_MMU
 pid_t xfork(void) FAST_FUNC;
 #endif
-void xvfork_parent_waits_and_exits(void) FAST_FUNC;
+pid_t bb_clone(int (*child_func)(void *), unsigned flags, void *arg) FAST_FUNC;
+pid_t xclone(int (*child_func)(void *), unsigned flags, void *arg) FAST_FUNC;
+void bb_clone_parent_waits_and_exits(int (*child_func)(void *), void *arg) NORETURN FAST_FUNC;
 
 /* NOMMU friendy fork+exec: */
 pid_t spawn(char **argv) FAST_FUNC;

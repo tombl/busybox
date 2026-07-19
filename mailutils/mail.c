@@ -14,6 +14,7 @@
 # define PROCCTL
 #endif
 #include "libbb.h"
+#include <sched.h>
 #include "mail.h"
 
 // common signal handler
@@ -37,11 +38,36 @@ static void signal_handler(int signo)
 #undef status
 }
 
+struct mail_helper_args {
+	const char **argv;
+	struct fd_pair child_out;
+	struct fd_pair child_in;
+};
+
+static int mail_helper_child(void *data)
+{
+	struct mail_helper_args *args = data;
+	close(args->child_in.wr);
+	close(args->child_out.rd);
+	xmove_fd(args->child_in.rd, STDIN_FILENO);
+	xmove_fd(args->child_out.wr, STDOUT_FILENO);
+#if defined(PRCTL)
+	prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
+#elif defined(PROCCTL)
+	{
+		int signum = SIGTERM;
+		procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &signum);
+	}
+#endif
+	BB_EXECVP_or_die((char **) args->argv);
+}
+
 void FAST_FUNC launch_helper(const char **argv)
 {
 	pid_t pid;
 	struct fd_pair child_out;
 	struct fd_pair child_in;
+	struct mail_helper_args args;
 
 	xpiped_pair(child_out);
 	xpiped_pair(child_in);
@@ -53,26 +79,10 @@ void FAST_FUNC launch_helper(const char **argv)
 		, signal_handler);
 
 	fflush_all();
-	pid = xvfork();
-	if (pid == 0) {
-		// child
-		close(child_in.wr);
-		close(child_out.rd);
-		xmove_fd(child_in.rd, STDIN_FILENO);
-		xmove_fd(child_out.wr, STDOUT_FILENO);
-		// if parent dies, get SIGTERM
-#if defined(PRCTL)
-		prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
-#elif defined(PROCCTL)
-		{
-			int signum = SIGTERM;
-			procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &signum);
-		}
-#endif
-		// try to execute connection helper
-		// NB: SIGCHLD & SIGALRM revert to SIG_DFL on exec
-		BB_EXECVP_or_die((char**)argv);
-	}
+	args.argv = argv;
+	args.child_out = child_out;
+	args.child_in = child_in;
+	pid = xclone(mail_helper_child, CLONE_VM | CLONE_VFORK, &args);
 	G.helper_pid = pid;
 	close(child_out.wr);
 	close(child_in.rd);

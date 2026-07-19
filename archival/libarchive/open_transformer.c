@@ -2,7 +2,6 @@
 /*
  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
  */
-#include <sched.h>   /* for clone() */
 #include "libbb.h"
 #include "bb_archive.h"
 
@@ -163,10 +162,8 @@ void FAST_FUNC fork_transformer(int fd,
 void FAST_FUNC fork_transformer(int fd, const char *transform_prog)
 #endif
 {
-	char child_stack[4096];
 	struct fd_pair fd_pipe;
 	struct transformer_args args;
-	pid_t pid;
 
 	xpiped_pair(fd_pipe);
 
@@ -180,14 +177,7 @@ void FAST_FUNC fork_transformer(int fd, const char *transform_prog)
 	args.transform_prog = transform_prog;
 #endif
 
-	pid = clone(transformer_child_func,
-		child_stack + sizeof(child_stack),
-		CLONE_VM | CLONE_VFORK | SIGCHLD,
-		&args
-	);
-
-	if (pid < 0)
-		bb_perror_msg_and_die("clone");
+	xclone(transformer_child_func, 0, &args);
 
 	/* parent process */
 	close(fd_pipe.wr); /* don't want to write to the child */

@@ -155,6 +155,7 @@ Misc options:
 /* Override ENABLE_FEATURE_PIDFILE */
 #define WANT_PIDFILE 1
 #include "libbb.h"
+#include <sched.h>
 #include "common_bufsiz.h"
 
 struct pid_list {
@@ -444,6 +445,69 @@ static const char start_stop_daemon_longopts[] ALIGN1 =
 # define LONGOPTS
 #endif
 
+struct start_child_args {
+	unsigned opts;
+	char *chuid;
+	const char *chdir;
+	const char *output;
+	const char *startas;
+	char **argv;
+#if ENABLE_FEATURE_START_STOP_DAEMON_FANCY
+	const char *nicelevel;
+#endif
+};
+
+static int start_child(void *data)
+{
+	struct start_child_args *args = data;
+	unsigned opt = args->opts;
+
+	if (opt & OPT_MAKEPID)
+		write_pidfile(pidfile);
+#if ENABLE_FEATURE_START_STOP_DAEMON_FANCY
+	if (opt & OPT_NICELEVEL) {
+		int prio = getpriority(PRIO_PROCESS, 0)
+			+ xatoi_range(args->nicelevel, INT_MIN/2, INT_MAX/2);
+		if (setpriority(PRIO_PROCESS, 0, prio) < 0)
+			bb_perror_msg_and_die("setpriority(%d)", prio);
+	}
+#endif
+	if (opt & OPT_c) {
+		struct bb_uidgid_t ugid;
+		parse_chown_usergroup_or_die(&ugid, args->chuid);
+		if (ugid.uid != (uid_t) -1L) {
+			struct passwd *pw = xgetpwuid(ugid.uid);
+			if (ugid.gid != (gid_t) -1L)
+				pw->pw_gid = ugid.gid;
+			change_identity(pw);
+		} else if (ugid.gid != (gid_t) -1L) {
+			xsetgid(ugid.gid);
+			setgroups(1, &ugid.gid);
+		}
+	}
+	if (opt & OPT_d)
+		xchdir(args->chdir);
+	if (args->output) {
+		int outfd = xopen(args->output, O_WRONLY | O_CREAT | O_APPEND);
+		xmove_fd(outfd, STDOUT_FILENO);
+		xdup2(STDOUT_FILENO, STDERR_FILENO);
+	}
+	execvp(execname, args->argv);
+	bb_perror_msg_and_die("can't execute '%s'", args->startas);
+}
+
+static int daemon_launcher(void *data)
+{
+	struct start_child_args *args = data;
+
+	setsid();
+	bb_daemon_helper(DAEMON_DEVNULL_STDIN + DAEMON_CLOSE_EXTRA_FDS);
+	if (!args->output)
+		args->output = bb_dev_null;
+	xclone(start_child, CLONE_VM | CLONE_VFORK, args);
+	return 0;
+}
+
 int start_stop_daemon_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int start_stop_daemon_main(int argc UNUSED_PARAM, char **argv)
 {
@@ -458,6 +522,7 @@ int start_stop_daemon_main(int argc UNUSED_PARAM, char **argv)
 //	int retries = -1;
 	const char *opt_N;
 #endif
+	struct start_child_args child_args;
 
 	INIT_G();
 
@@ -554,6 +619,14 @@ int start_stop_daemon_main(int argc UNUSED_PARAM, char **argv)
 		xstat(execname, &G.execstat);
 #endif
 
+	child_args.opts = opt;
+	child_args.chuid = chuid;
+	child_args.chdir = chdir;
+	child_args.output = output;
+	child_args.startas = startas;
+	child_args.argv = argv;
+	IF_FEATURE_START_STOP_DAEMON_FANCY(child_args.nicelevel = opt_N;)
+
 	if (opt & OPT_BACKGROUND) {
 		/* Daemons usually call bb_daemonize_or_rexec(), but SSD can do
 		 * without: SSD is not itself a daemon, it _execs_ a daemon.
@@ -566,69 +639,9 @@ int start_stop_daemon_main(int argc UNUSED_PARAM, char **argv)
 		 * _before_ parent returns, and vfork() on Linux
 		 * ensures that (by blocking parent until exec in the child).
 		 */
-		pid_t pid = xvfork();
-		if (pid != 0) {
-			/* Parent */
-			/* why _exit? the child may have changed the stack,
-			 * so "return 0" may do bad things
-			 */
-			_exit_SUCCESS();
-		}
-		/* Child */
-		setsid(); /* detach from controlling tty */
-		/* Redirect stdin to /dev/null, close extra FDs */
-		/* Testcase: "start-stop-daemon -Sb -d /does/not/exist usleep 1" should not eat error message */
-		bb_daemon_helper(DAEMON_DEVNULL_STDIN + DAEMON_CLOSE_EXTRA_FDS);
-		if (!output)
-			output = bb_dev_null; /* redirect output just before execv */
-		/* On Linux, session leader can acquire ctty
-		 * unknowingly, by opening a tty.
-		 * Prevent this: stop being a session leader.
-		 */
-		pid = xvfork();
-		if (pid != 0)
-			_exit_SUCCESS(); /* Parent */
+		pid_t pid = xclone(daemon_launcher, 0, &child_args);
+		wait4pid(pid);
+		_exit_SUCCESS();
 	}
-	if (opt & OPT_MAKEPID) {
-		/* User wants _us_ to make the pidfile */
-		write_pidfile(pidfile);
-	}
-#if ENABLE_FEATURE_START_STOP_DAEMON_FANCY
-	if (opt & OPT_NICELEVEL) {
-		/* Set process priority (must be before OPT_c) */
-		int prio = getpriority(PRIO_PROCESS, 0) + xatoi_range(opt_N, INT_MIN/2, INT_MAX/2);
-		if (setpriority(PRIO_PROCESS, 0, prio) < 0) {
-			bb_perror_msg_and_die("setpriority(%d)", prio);
-		}
-	}
-#endif
-	if (opt & OPT_c) {
-		struct bb_uidgid_t ugid;
-		parse_chown_usergroup_or_die(&ugid, chuid);
-		if (ugid.uid != (uid_t) -1L) {
-			struct passwd *pw = xgetpwuid(ugid.uid);
-			if (ugid.gid != (gid_t) -1L)
-				pw->pw_gid = ugid.gid;
-			/* initgroups, setgid, setuid: */
-			change_identity(pw);
-		} else if (ugid.gid != (gid_t) -1L) {
-			xsetgid(ugid.gid);
-			setgroups(1, &ugid.gid);
-		}
-	}
-	if (opt & OPT_d) {
-		xchdir(chdir);
-	}
-	if (output) {
-		int outfd = xopen(output, O_WRONLY | O_CREAT | O_APPEND);
-		xmove_fd(outfd, STDOUT_FILENO);
-		xdup2(STDOUT_FILENO, STDERR_FILENO);
-		/* on execv error, the message goes to -O file. This is intended */
-	}
-	/* Try:
-	 * strace -oLOG start-stop-daemon -S -x /bin/usleep -a qwerty 500000
-	 * should exec "/bin/usleep", but argv[0] should be "qwerty":
-	 */
-	execvp(execname, argv);
-	bb_perror_msg_and_die("can't execute '%s'", startas);
+	return start_child(&child_args);
 }

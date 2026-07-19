@@ -34,29 +34,28 @@
 //usage:     "\n	FILE	Replace crontab by FILE ('-': stdin)"
 
 #include "libbb.h"
+#include <sched.h>
 
 #define CRONTABS        CONFIG_FEATURE_CROND_DIR "/crontabs"
 #ifndef CRONUPDATE
 #define CRONUPDATE      "cron.update"
 #endif
 
-static void edit_file(const struct passwd *pas, const char *file)
+struct editor_args {
+	const struct passwd *passwd;
+	const char *file;
+};
+
+static int editor_child(void *data)
 {
+	struct editor_args *args = data;
 	const char *ptr;
-	pid_t pid;
 
-	pid = xvfork();
-	if (pid) { /* parent */
-		wait4pid(pid);
-		return;
-	}
-
-	/* CHILD - change user and run editor */
 	/* initgroups, setgid, setuid */
-	change_identity(pas);
-	setup_environment(pas->pw_shell,
+	change_identity(args->passwd);
+	setup_environment(args->passwd->pw_shell,
 		SETUP_ENV_CHANGEENV | SETUP_ENV_TO_TMP | SETUP_ENV_CHDIR,
-		pas);
+		args->passwd);
 	ptr = getenv("VISUAL");
 	if (!ptr) {
 		ptr = getenv("EDITOR");
@@ -64,8 +63,15 @@ static void edit_file(const struct passwd *pas, const char *file)
 			ptr = "vi";
 	}
 
-	BB_EXECLP(ptr, ptr, file, NULL);
+	BB_EXECLP(ptr, ptr, args->file, NULL);
 	bb_perror_msg_and_die("can't execute '%s'", ptr);
+}
+
+static void edit_file(const struct passwd *pas, const char *file)
+{
+	struct editor_args args = { pas, file };
+	pid_t pid = xclone(editor_child, CLONE_VM | CLONE_VFORK, &args);
+	wait4pid(pid);
 }
 
 int crontab_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
