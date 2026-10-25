@@ -406,7 +406,7 @@ static void processorstart(struct logdir *ld)
 	if (!G.shell)
 		G.shell = xstrdup(get_shell_name());
 
-	while ((pid = vfork()) == -1)
+	while ((pid = bb_vfork()) == -1)
 		pause2cannot("vfork for processor", ld->name);
 	if (!pid) {
 		int fd;

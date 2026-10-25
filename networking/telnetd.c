@@ -497,7 +497,7 @@ make_new_session(
 	}
 
 	fflush_all();
-	pid = vfork(); /* NOMMU-friendly */
+	pid = bb_vfork(); /* NOMMU-friendly */
 	if (pid < 0) {
 		free(ts);
 		close(fd);

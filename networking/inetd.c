@@ -1402,7 +1402,7 @@ int inetd_main(int argc UNUSED_PARAM, char **argv)
 					pid = fork();
 				else
 #endif
-					pid = vfork();
+					pid = bb_vfork();
 
 				if (pid < 0) { /* fork error */
 					bb_simple_perror_msg("vfork"+1);
