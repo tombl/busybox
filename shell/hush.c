@@ -9608,12 +9608,19 @@ static int prepare_spawn_pipe_child(struct spawn_pipe_args *args,
 	}
 
 	for (redir = command->redirects; redir; redir = redir->next) {
+		char *name;
+		struct stat st;
+
 		if (redir->rd_dup != REDIRFD_TO_FILE)
 			continue;
-		args->redir_files = add_string_to_strings(args->redir_files,
-			expand_string_to_string(redir->rd_filename,
-				EXP_FLAG_ESC_GLOB_CHARS, /*unbackslash:*/ 1)
-		);
+		name = expand_string_to_string(redir->rd_filename,
+				EXP_FLAG_ESC_GLOB_CHARS, /*unbackslash:*/ 1);
+		args->redir_files = add_string_to_strings(args->redir_files, name);
+		/* Opening a FIFO blocks until its other end is opened, and
+		 * the opener may be this shell, suspended until the child
+		 * execs: "cmd <fifo & exec 3>fifo" would never return. */
+		if (stat(name, &st) == 0 && S_ISFIFO(st.st_mode))
+			goto fail;
 	}
 	return 1;
 
