@@ -538,7 +538,7 @@ int login_main(int argc UNUSED_PARAM, char **argv)
 	update_utmp(my_pid, USER_PROCESS, short_tty, username, run_by_root ? opt_host : NULL);
 
 #if ENABLE_LOGIN_SESSION_AS_CHILD
-	child_pid = vfork();
+	child_pid = bb_vfork();
 	if (child_pid != 0) {
 		if (child_pid < 0)
 			bb_simple_perror_msg("vfork");

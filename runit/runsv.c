@@ -287,7 +287,7 @@ static unsigned custom(struct svdir *s, char c)
 	a[8] = c; /* replace '?' */
 	if (stat(a, &st) == 0) {
 		if (st.st_mode & S_IXUSR) {
-			pid = vfork();
+			pid = bb_vfork();
 			if (pid == -1) {
 				warn2_cannot("vfork for ", a);
 				return 0;
@@ -364,7 +364,7 @@ static void startservice(struct svdir *s)
 
 	if (s->pid != 0)
 		stopservice(s); /* should never happen */
-	while ((p = vfork()) == -1) {
+	while ((p = bb_vfork()) == -1) {
 		warn_cannot("vfork, sleeping");
 		sleep(5);
 	}

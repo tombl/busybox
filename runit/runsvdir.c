@@ -124,7 +124,7 @@ static NOINLINE pid_t runsv(const char *name)
 	if (bb_got_signal)
 		return 0;
 
-	pid = vfork();
+	pid = bb_vfork();
 	if (pid == -1) {
 		warn2_cannot("vfork", "");
 		return 0;

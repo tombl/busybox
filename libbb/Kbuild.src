@@ -106,6 +106,7 @@ lib-y += u_signal_names.o
 lib-y += uuencode.o
 lib-y += verror_msg.o
 lib-y += vfork_daemon_rexec.o
+lib-y += vforked_child.o
 lib-y += warn_ignoring_args.o
 lib-y += wfopen.o
 lib-y += wfopen_input.o

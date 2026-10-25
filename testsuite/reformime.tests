@@ -1,0 +1,16 @@
+#!/bin/sh
+
+# Licensed under GPLv2, see file LICENSE in this source tree.
+
+. ./testing.sh
+
+# testing "description" "arguments" "result" "infile" "stdin"
+
+# reformime runs each -X helper in a vforked child. When its exec fails,
+# the child must not take reformime's own exit down with it. reformime
+# exits with the helper's status plus 20.
+testing "reformime -X of a missing program exits 147" \
+	"reformime -X /nonexistent/program 2>/dev/null; echo \$?" \
+	'147\n' '' 'Content-Type: text/plain\n\nhello\n'
+
+exit $FAILCOUNT

@@ -171,7 +171,7 @@ static int parse(const char *boundary, char **argv)
 
 				/* start external helper */
 				xpipe(fd);
-				pid = vfork();
+				pid = bb_vfork();
 				if (0 == pid) {
 					/* child reads from fd[0] */
 					close(fd[1]);

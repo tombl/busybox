@@ -1,0 +1,10 @@
+# FEATURE: CONFIG_FEATURE_WGET_OPENSSL
+
+# wget runs its openssl helper in a vforked child. With no openssl binary
+# the helper's exec fails and it dies, which must not take wget's own exit
+# down with it. -Y off keeps a configured proxy from bypassing the helper.
+# Nothing can listen on port 0, so wget then fails to connect and exits 1.
+bb=$(command -v busybox)
+status=0
+PATH=/nonexistent "$bb" wget -Y off -T 5 -q -O /dev/null https://127.0.0.1:0/ 2>/dev/null || status=$?
+test $status = 1

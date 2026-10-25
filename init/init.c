@@ -483,7 +483,7 @@ static pid_t run(const struct init_action *a)
 	if (BB_MMU && (a->action_type & ASKFIRST))
 		pid = fork();
 	else
-		pid = vfork();
+		pid = bb_vfork();
 	if (pid) {
 		if (pid < 0)
 			message(L_LOG | L_CONSOLE, "can't fork");
@@ -741,7 +741,7 @@ static void pause_and_low_level_reboot(unsigned magic)
 	/* We have to fork here, since the kernel calls do_exit(EXIT_SUCCESS)
 	 * in linux/kernel/sys.c, which can cause the machine to panic when
 	 * the init process exits... */
-	pid = vfork();
+	pid = bb_vfork();
 	if (pid == 0) { /* child */
 		reboot(magic);
 		_exit_SUCCESS();
@@ -937,7 +937,7 @@ static void reload_inittab(void)
 			kill(a->pid, SIGTERM);
 	if (CONFIG_FEATURE_KILL_DELAY) {
 		/* NB: parent will wait in NOMMU case */
-		if ((BB_MMU ? fork() : vfork()) == 0) { /* child */
+		if ((BB_MMU ? fork() : bb_vfork()) == 0) { /* child */
 			sleep(CONFIG_FEATURE_KILL_DELAY);
 			for (a = G.init_action_list; a; a = a->next)
 				if (a->action_type == 0 && a->pid != 0)
