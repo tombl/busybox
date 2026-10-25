@@ -355,6 +355,7 @@
 #endif
 #include <sys/times.h>
 #include <sys/utsname.h> /* for setting $HOSTNAME */
+#include <sched.h> /* for CLONE_VM */
 
 #include "busybox.h"  /* for APPLET_IS_NOFORK/NOEXEC */
 #include "unicode.h"
@@ -9426,6 +9427,322 @@ static int run_pipe_child(void *arg)
 	/* pseudo_exec() does not return */
 }
 
+
+/* Pipe members and background jobs which run nothing but an external
+ * program are spawned the way posix_spawn() does it: a CLONE_VM|CLONE_VFORK
+ * child that applies fds and signal dispositions, then execs.
+ * Everything else gets a private copy of our memory (run_pipe_child above),
+ * which gives it real fork semantics.
+ *
+ * A copy of the address space is not free on wasm: every process owns
+ * its own WebAssembly.Memory, and browsers cap how many of those a tab
+ * may reserve.  A copy which execs straight away costs one reservation for
+ * the copy plus one for the new program; sharing ours costs only the latter.
+ *
+ * The child runs on our memory while we are suspended, so it must not
+ * store to anything we can see: no hush globals, no heap, no stdio.
+ * The parent therefore expands argv, the "VAR=val" prefix, redirect
+ * filenames and envp before cloning.  This is only done when expansion
+ * has no side effects, so doing it here instead of in a forked child
+ * cannot be observed.
+ */
+struct spawn_pipe_args {
+	struct pipe *pi;
+	struct command *command;
+	char **argv;
+	char **envp;
+	char **assignments;
+	/* expanded REDIRFD_TO_FILE names, in redirect list order */
+	char **redir_files;
+	struct fd_pair pipefds;
+	int input_fd;
+	sigset_t old_mask;
+};
+
+/* Plain $var, ${var}, special parameters, quoting and globs are fine.
+ * `cmd`, $((arith)), ${var<op>word} and $RANDOM have side effects */
+static int word_expands_purely(const char *s)
+{
+	while ((s = strchr(s, SPECIAL_VAR_SYMBOL)) != NULL) {
+		const char *end;
+		const char *p;
+
+		s++;
+		end = strchr(s, SPECIAL_VAR_SYMBOL);
+		if (!end)
+			return 0;
+		if (end == s || (end == s + 1 && *s == SPECIAL_VAR_QUOTED_SVS)) {
+			/* "" or literal ^C */
+			s = end + 1;
+			continue;
+		}
+		if (end == s + 1 && strchr(SPECIAL_VARS_STR, *s & 0x7f)) {
+			s = end + 1;
+			continue;
+		}
+		for (p = s; p < end; p++) {
+			unsigned char c = (p == s) ? (*p & 0x7f) : *p;
+			if (!isalnum(c) && c != '_')
+				return 0;
+		}
+#if ENABLE_HUSH_RANDOM_SUPPORT
+		if (end - s == 6 && strncmp(s, "RANDOM", 6) == 0)
+			return 0;
+#endif
+		s = end + 1;
+	}
+	return 1;
+}
+
+static void free_spawn_pipe_args(struct spawn_pipe_args *args, char **argv_expanded)
+{
+	if (args->argv != argv_expanded)
+		free(args->argv);
+	if (args->envp != environ)
+		free(args->envp);
+	free_strings(args->assignments);
+	free_strings(args->redir_files);
+}
+
+/* Returns 1 and fills args if the command may share our memory */
+static int prepare_spawn_pipe_child(struct spawn_pipe_args *args,
+		struct command *command, char **argv_expanded)
+{
+	char **argv = command->argv;
+	struct redir_struct *redir;
+	unsigned i, n;
+	char **ep;
+
+	memset(args, 0, sizeof(*args));
+	if (!argv || !argv[command->assignment_cnt]
+	 || command->group || command->cmd_type != CMD_NORMAL
+	 || G_x_mode
+	) {
+		return 0;
+	}
+	for (i = 0; argv[i]; i++) {
+		/* argv_expanded has already been expanded by run_pipe() */
+		if (argv_expanded && i >= command->assignment_cnt)
+			break;
+		if (!word_expands_purely(argv[i]))
+			return 0;
+	}
+	for (redir = command->redirects; redir; redir = redir->next) {
+		/* heredocs spawn a writer and touch G */
+		if (redir->rd_type == REDIRECT_HEREDOC
+		 || redir->rd_type == REDIRECT_HEREDOC2
+		) {
+			return 0;
+		}
+		/* moving our tty fd out of the way would modify G */
+		if (G_interactive_fd && redir->rd_fd == G_interactive_fd)
+			return 0;
+		if (redir->rd_dup == REDIRFD_TO_FILE) {
+			if (!redir->rd_filename
+			 || !word_expands_purely(redir->rd_filename)
+			) {
+				return 0;
+			}
+		} else if (redir->rd_dup != REDIRFD_CLOSE) {
+			/* leave error reporting to the forked child */
+			if (redir->rd_dup < 0
+			 || internally_opened_fd(redir->rd_dup, NULL)
+			) {
+				return 0;
+			}
+		}
+	}
+
+	args->argv = argv_expanded;
+	if (!args->argv)
+		args->argv = expand_strvec_to_strvec(argv + command->assignment_cnt);
+	if (!args->argv[0]
+	 IF_HUSH_FUNCTIONS(|| find_function(args->argv[0]))
+	 /* pseudo_exec_argv() handles "command" itself */
+	 IF_HUSH_COMMAND(|| strcmp(args->argv[0], "command") == 0)
+	 || find_builtin(args->argv[0])
+#if ENABLE_FEATURE_SH_STANDALONE
+	 || find_applet_by_name(args->argv[0]) >= 0
+#endif
+	) {
+		goto fail;
+	}
+
+	args->assignments = expand_assignments(argv, command->assignment_cnt);
+	args->envp = environ;
+	if (args->assignments) {
+		char **ap;
+
+		for (ap = args->assignments; *ap; ap++) {
+			struct variable **vpp;
+
+			/* execvpe() searches the parent's $PATH */
+			if (varcmp(*ap, "PATH") == 0)
+				goto fail;
+			/* set_vars_and_save_old() complains and drops these */
+			vpp = get_ptr_to_local_var(*ap);
+			if (vpp && (*vpp)->flg_read_only)
+				goto fail;
+		}
+
+		/* Like set_vars_and_save_old(): the prefix overrides the
+		 * environment, and the last of repeated names wins */
+		n = string_array_len(environ) + (ap - args->assignments) + 1;
+		args->envp = ep = xmalloc(n * sizeof(ep[0]));
+		for (i = 0; environ[i]; i++) {
+			for (ap = args->assignments; *ap; ap++)
+				if (varcmp(environ[i], *ap) == 0)
+					break;
+			if (!*ap)
+				*ep++ = environ[i];
+		}
+		for (ap = args->assignments; *ap; ap++) {
+			char **later;
+			for (later = ap + 1; *later; later++)
+				if (varcmp(*later, *ap) == 0)
+					break;
+			if (!*later)
+				*ep++ = *ap;
+		}
+		*ep = NULL;
+	}
+
+	for (redir = command->redirects; redir; redir = redir->next) {
+		if (redir->rd_dup != REDIRFD_TO_FILE)
+			continue;
+		args->redir_files = add_string_to_strings(args->redir_files,
+			expand_string_to_string(redir->rd_filename,
+				EXP_FLAG_ESC_GLOB_CHARS, /*unbackslash:*/ 1)
+		);
+	}
+	return 1;
+
+ fail:
+	free_spawn_pipe_args(args, argv_expanded);
+	return 0;
+}
+
+/* bb_perror_msg() allocates, which would write to the parent's heap */
+static void spawn_pipe_child_die(int status, const char *fmt, ...) NORETURN;
+static void spawn_pipe_child_die(int status, const char *fmt, ...)
+{
+	char buf[256];
+	const char *err = strerror(errno);
+	va_list p;
+	int len;
+
+	len = snprintf(buf, sizeof(buf), "%s: ", applet_name);
+	va_start(p, fmt);
+	if (len < (int)sizeof(buf))
+		len += vsnprintf(buf + len, sizeof(buf) - len, fmt, p);
+	va_end(p);
+	if (len < (int)sizeof(buf))
+		len += snprintf(buf + len, sizeof(buf) - len, ": %s\n", err);
+	if (len >= (int)sizeof(buf))
+		len = sizeof(buf) - 1;
+	full_write(STDERR_FILENO, buf, len);
+	_exit(status);
+}
+
+static int spawn_pipe_child(void *arg)
+{
+	struct spawn_pipe_args *args = arg;
+	struct pipe *pi = args->pi;
+	struct redir_struct *redir;
+	char **redir_file;
+	struct sigaction sa;
+	int sig;
+
+	/* The parent blocked all signals before cloning: hush's handlers
+	 * would record them in the parent's G.  Reset caught signals, and
+	 * the job control signals hush ignores, before unblocking. */
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = SIG_DFL;
+	for (sig = 1; sig < NSIG; sig++) {
+		struct sigaction old;
+
+		if (sigaction(sig, NULL, &old) != 0
+		 || old.sa_handler == SIG_DFL
+		) {
+			continue;
+		}
+		if (old.sa_handler == SIG_IGN) {
+			/* see execvp_or_die(): keep SIG_IGN, except for
+			 * SPECIAL_JOBSTOP_SIGS which are not trapped '' */
+			if (sig >= 32
+			 || !(G.special_sig_mask & SPECIAL_JOBSTOP_SIGS & (1 << sig))
+			 || (G_traps && G_traps[sig] && !G_traps[sig][0])
+			) {
+				continue;
+			}
+		}
+		sigaction(sig, &sa, NULL);
+	}
+
+#if ENABLE_HUSH_JOB
+	if (G.run_list_level == 1 && G_interactive_fd) {
+		pid_t pgrp;
+		pgrp = pi->pgrp;
+		if (pgrp < 0) /* true for 1st process only */
+			pgrp = getpid();
+		if (setpgid(0, pgrp) == 0
+		 && pi->followup != PIPE_BG
+		 && G_saved_tty_pgrp /* we have ctty */
+		) {
+			tcsetpgrp(G_interactive_fd, pgrp);
+		}
+	}
+#endif
+	if (pi->alive_cmds == 0 && pi->followup == PIPE_BG) {
+		close(0);
+		if (open(bb_dev_null, O_RDONLY) != 0
+		 && open("/", O_RDONLY) < 0
+		) {
+			spawn_pipe_child_die(1, "can't open '%s'", "/");
+		}
+	} else if (args->input_fd != 0) {
+		if (dup2(args->input_fd, 0) < 0)
+			spawn_pipe_child_die(1, "can't duplicate file descriptor");
+		close(args->input_fd);
+	}
+	if (args->pipefds.wr != 1) {
+		if (dup2(args->pipefds.wr, 1) < 0)
+			spawn_pipe_child_die(1, "can't duplicate file descriptor");
+		close(args->pipefds.wr);
+	}
+	if (args->pipefds.rd > 1)
+		close(args->pipefds.rd);
+
+	/* setup_redirects(command, NULL), minus the expansion */
+	redir_file = args->redir_files;
+	for (redir = args->command->redirects; redir; redir = redir->next) {
+		int newfd = redir->rd_dup;
+
+		if (newfd == REDIRFD_TO_FILE) {
+			newfd = open(*redir_file, redir_table[redir->rd_type].mode, 0666);
+			if (newfd < 0)
+				spawn_pipe_child_die(1, "can't open '%s'", *redir_file);
+			redir_file++;
+		}
+		if (newfd == redir->rd_fd)
+			continue;
+		if (newfd == REDIRFD_CLOSE) {
+			close(redir->rd_fd);
+			continue;
+		}
+		if (dup2(newfd, redir->rd_fd) < 0)
+			spawn_pipe_child_die(1, "dup2(%d,%d)", newfd, redir->rd_fd);
+		if (redir->rd_dup == REDIRFD_TO_FILE)
+			close(newfd);
+	}
+
+	sigprocmask(SIG_SETMASK, &args->old_mask, NULL);
+	execvpe(args->argv[0], args->argv, args->envp);
+	/* same exit codes as execvp_or_die() */
+	spawn_pipe_child_die(errno == EACCES ? 126 : errno == ENOENT ? 127 : 2,
+			"can't execute '%s'", args->argv[0]);
+}
+
 static NOINLINE int run_pipe(struct pipe *pi)
 {
 	static const char *const null_ptr = NULL;
@@ -9729,6 +10046,7 @@ static NOINLINE int run_pipe(struct pipe *pi)
 	while (cmd_no < pi->num_cmds) {
 		struct fd_pair pipefds;
 		struct run_pipe_args args;
+		struct spawn_pipe_args spawn_args;
 		command = &pi->cmds[cmd_no];
 		cmd_no++;
 		if (command->argv) {
@@ -9755,7 +10073,25 @@ static NOINLINE int run_pipe(struct pipe *pi)
 #endif
 		args.pipefds = pipefds;
 		args.input_fd = next_infd;
-		command->pid = bb_clone(run_pipe_child, 0, &args);
+		if (prepare_spawn_pipe_child(&spawn_args, command, argv_expanded)) {
+			sigset_t all;
+			int errno_save;
+
+			spawn_args.pi = pi;
+			spawn_args.command = command;
+			spawn_args.pipefds = pipefds;
+			spawn_args.input_fd = next_infd;
+			sigfillset(&all);
+			sigprocmask(SIG_SETMASK, &all, &spawn_args.old_mask);
+			/* returns once the child has execed or exited */
+			command->pid = bb_clone(spawn_pipe_child, CLONE_VM | CLONE_VFORK, &spawn_args);
+			errno_save = errno;
+			sigprocmask(SIG_SETMASK, &spawn_args.old_mask, NULL);
+			free_spawn_pipe_args(&spawn_args, argv_expanded);
+			errno = errno_save;
+		} else {
+			command->pid = bb_clone(run_pipe_child, 0, &args);
+		}
 
 		/* parent or error */
 #if ENABLE_HUSH_FAST
