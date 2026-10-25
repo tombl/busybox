@@ -21,11 +21,33 @@
 #define NOFORK_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_NOFORK))
 #define NOEXEC_SUPPORT ((NUM_APPLETS > 1) && (ENABLE_FEATURE_PREFER_APPLETS || ENABLE_FEATURE_SH_STANDALONE))
 
+struct clone_args {
+	int (*child_func)(void *);
+	void *arg;
+};
+
+static int clone_vm_child(void *data)
+{
+	struct clone_args *args = (struct clone_args *)data;
+
+	bb_vfork_finish(0, NULL);
+	return args->child_func(args->arg);
+}
+
+static int clone_copy_child(void *data)
+{
+	struct clone_args *args = (struct clone_args *)data;
+
+	bb_forget_vforks();
+	return args->child_func(args->arg);
+}
+
 /* The callback-style clone interface requires a separate child stack.  Keep
  * stack allocation in one place so process-clone call sites only have to say
  * whether memory is copied or shared.  A private clone gets its own copy of
  * this allocation; a CLONE_VM clone must also use CLONE_VFORK, which keeps the
- * parent here until the child has execed or exited. */
+ * parent here until the child has execed or exited.  Such a child is vforked
+ * in every sense that matters, so it is marked like one (see bb_vfork). */
 pid_t FAST_FUNC bb_clone(int (*child_func)(void *), unsigned flags, void *arg)
 {
 	enum { CHILD_STACK_SIZE = 128 * 1024 };
@@ -33,14 +55,42 @@ pid_t FAST_FUNC bb_clone(int (*child_func)(void *), unsigned flags, void *arg)
 	pid_t pid;
 	int errno_save;
 
+	/* A private copy, or a vforked child. Without CLONE_VFORK a CLONE_VM
+	 * parent would run alongside its child in the same memory, which
+	 * vfork tracking (see bb_vfork) doesn't support. */
+	if (flags != 0 && flags != (CLONE_VM | CLONE_VFORK)) {
+		errno = EINVAL;
+		return -1;
+	}
+
 	child_stack = malloc(CHILD_STACK_SIZE);
 	if (!child_stack)
 		return -1;
 
-	pid = clone(child_func,
-		(char *) child_stack + CHILD_STACK_SIZE,
-		flags | SIGCHLD,
-		arg);
+	if (flags & CLONE_VM) {
+		/* Kept at the top of the child's own stack rather than in our
+		 * frame: if we are killed before the child starts, our frame
+		 * may be reused, but this stack is never freed. */
+		struct clone_args *args = (struct clone_args *)
+			((char *) child_stack + CHILD_STACK_SIZE - sizeof(*args)
+				- (CHILD_STACK_SIZE - sizeof(*args)) % 16);
+
+		args->child_func = child_func;
+		args->arg = arg;
+		pid = bb_vfork_prepare(args);
+		if (pid == 0) {
+			pid = clone(clone_vm_child, args, flags | SIGCHLD, args);
+			bb_vfork_finish(pid, args);
+		}
+	} else {
+		/* The child's copy of args is its own. */
+		struct clone_args args = { child_func, arg };
+
+		pid = clone(clone_copy_child,
+			(char *) child_stack + CHILD_STACK_SIZE,
+			flags | SIGCHLD,
+			&args);
+	}
 	errno_save = errno;
 	free(child_stack);
 	errno = errno_save;

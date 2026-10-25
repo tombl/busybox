@@ -1254,9 +1254,55 @@ int BB_EXECVP(const char *file, char *const argv[]) FAST_FUNC;
 #endif
 void BB_EXECVP_or_die(char **argv) NORETURN FAST_FUNC;
 
+/* A vforked child (one made by vfork(), or by bb_clone() with CLONE_VM)
+ * shares its parent's memory until it execs or exits, and the parent stays
+ * suspended until then. Everything the child does to memory, it does to the
+ * parent: stdio buffers, atexit handlers, malloc state and libc's private
+ * bookkeeping all belong to the parent. bb_vforked_child() is nonzero in such
+ * a child, so that code which would disturb that state (see xfunc_die) can
+ * tell.
+ *
+ * Use bb_vfork() or xvfork() rather than vfork(), so the child is marked. Both
+ * must be macros: the function that called vfork() must not return until the
+ * child has execed or exited, or the child clobbers the parent's stack frame.
+ * bb_vfork_prepare() blocks the parent's signals across the vfork, so that
+ * none of its handlers runs while the child's mark is visible in the shared
+ * memory; bb_vfork_finish() undoes that in both processes. What the parent
+ * needs to undo it is kept in libbb, not in the caller's frame, where the
+ * child's own locals may reuse the space before the parent resumes.
+ *
+ * Vforked children may vfork again. Nothing is guaranteed once a parent is
+ * killed while it is suspended in a vfork: see libbb/vforked_child.c.
+ */
+int bb_vforked_child(void) FAST_FUNC;
+int bb_vfork_prepare(const void *token) FAST_FUNC;
+void bb_vfork_finish(pid_t pid, const void *token) FAST_FUNC;
+/* A child with a private copy of memory calls this first, unless it was made
+ * by fork(), daemon() or bb_clone(), which see to it. */
+void bb_forget_vforks(void) FAST_FUNC;
+/* Only bb__vfork_token's address matters, as the parent's token. */
+#define bb_vfork() \
+({ \
+	char bb__vfork_token = 0; \
+	pid_t bb__vfork_pid = bb_vfork_prepare(&bb__vfork_token); \
+	if (bb__vfork_pid == 0) { \
+		bb__vfork_pid = vfork(); \
+		bb_vfork_finish(bb__vfork_pid, &bb__vfork_token); \
+	} \
+	bb__vfork_pid; \
+})
+#define xvfork() \
+({ \
+	pid_t bb__xvfork_pid = bb_vfork(); \
+	if (bb__xvfork_pid < 0) \
+		bb_simple_perror_msg_and_die("vfork"); \
+	bb__xvfork_pid; \
+})
 #if BB_MMU
 pid_t xfork(void) FAST_FUNC;
 #endif
+/* flags is 0, for a child with a private copy of memory, or
+ * CLONE_VM|CLONE_VFORK, for a vforked child. */
 pid_t bb_clone(int (*child_func)(void *), unsigned flags, void *arg) FAST_FUNC;
 pid_t xclone(int (*child_func)(void *), unsigned flags, void *arg) FAST_FUNC;
 void bb_clone_parent_waits_and_exits(int (*child_func)(void *), void *arg) NORETURN FAST_FUNC;
@@ -1338,6 +1384,12 @@ enum {
 };
 #if BB_MMU
   enum { re_execed = 0 };
+  /* A copy of memory must not inherit the vforks in progress (see bb_vfork),
+   * so every fork() and daemon() in busybox empties them in the child. */
+  pid_t bb_fork(void) FAST_FUNC;
+  int bb_daemon(int nochdir, int noclose) FAST_FUNC;
+# define fork()          bb_fork()
+# define daemon(a,b)     bb_daemon(a,b)
 # define fork_or_rexec(argv)                xfork()
 # define bb_daemonize_or_rexec(flags, argv) bb_daemonize_or_rexec(flags)
 # define bb_daemonize(flags)                bb_daemonize_or_rexec(flags, bogus)
