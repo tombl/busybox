@@ -34,4 +34,10 @@ testing "time -f percent percent" \
 	"time -f 'abc%%def' sleep 0 2>&1" \
 	'abc%def\n' '' ''
 
+# The command runs in a vforked child on NOMMU. When its exec fails, the
+# child must not take time's own exit down with it.
+testing "time of a missing program exits 127" \
+	"busybox time /nonexistent/program 2>/dev/null; echo \$?" \
+	'127\n' '' ''
+
 exit $FAILCOUNT
