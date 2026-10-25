@@ -13,9 +13,20 @@
 
 void (*die_func)(void);
 
+void FAST_FUNC bb_exit(int status)
+{
+	if (bb_vforked_child())
+		_exit(status);
+	/* The parentheses keep libbb.h's exit() macro from expanding. */
+	(exit)(status);
+}
+
 void FAST_FUNC xfunc_die(void)
 {
-	if (die_func)
+	/* die_func longjmps back into, or cleans up after, the parent's
+	 * code (a NOFORK applet's caller, a terminal to restore, a temporary
+	 * file to remove), which a vforked child must leave alone. */
+	if (die_func && !bb_vforked_child())
 		die_func();
 	exit(xfunc_error_retval);
 }

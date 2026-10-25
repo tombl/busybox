@@ -1501,6 +1501,15 @@ extern smallint logmode;
 extern uint8_t xfunc_error_retval;
 extern void (*die_func)(void);
 void xfunc_die(void) NORETURN FAST_FUNC;
+/* exit() in a vforked child (see bb_vfork) runs the parent's atexit handlers
+ * and flushes the parent's stdio buffers, and POSIX leaves it undefined. Some
+ * libcs also record which thread is exiting: musl's exit() traps if the same
+ * thread id exits twice, and a vforked child has its parent's id, so the
+ * parent crashes in its own exit() later. bb_exit() leaves a vforked child
+ * through _exit() instead, and every exit() in busybox is a bb_exit().
+ */
+void bb_exit(int status) NORETURN FAST_FUNC;
+#define exit(status) bb_exit(status)
 void bb_show_usage(void) NORETURN FAST_FUNC;
 void bb_error_msg(const char *s, ...) __attribute__ ((format (printf, 1, 2))) FAST_FUNC;
 void bb_simple_error_msg(const char *s) FAST_FUNC;
