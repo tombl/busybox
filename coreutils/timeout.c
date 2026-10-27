@@ -79,6 +79,12 @@ static int watcher_child(void *data)
 {
 	struct child_args *args = (struct child_args *)data;
 
+	/* Detach like bb_daemonize_or_rexec does for the forked watcher.
+	 * Holding the caller's stdio would keep a $(timeout ...) pipe open
+	 * after PROG exits, until the full timeout elapses. */
+	setsid();
+	bb_daemon_helper(DAEMON_DEVNULL_STDIO);
+
 	/* Sleep, then kill parent if it's still alive */
 	if (timeout_wait(args->timeout, args->parent_pid) == EXIT_SUCCESS)
 		return EXIT_SUCCESS;

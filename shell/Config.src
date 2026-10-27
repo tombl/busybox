@@ -15,7 +15,6 @@ choice
 
 # note: cannot use "select ASH" here, it breaks "make allnoconfig"
 config SH_IS_ASH
-	depends on !NOMMU
 	bool "ash"
 	select SHELL_ASH
 	help
@@ -57,7 +56,6 @@ choice
 	"bash" as a supported applet name.
 
 config BASH_IS_ASH
-	depends on !NOMMU
 	bool "ash"
 	select SHELL_ASH
 	help
