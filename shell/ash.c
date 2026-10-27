@@ -9415,6 +9415,14 @@ evaltree(union node *n, int flags)
 	}
 	TRACE(("evaltree(%p: %d, %d) called\n", n, n->type, flags));
 
+	/* wasm Linux preempts a task and delivers its signals only when it
+	 * enters the kernel. A loop of builtins makes no syscalls, so it would
+	 * hold its CPU and ignore even SIGKILL. Enter the kernel once per node,
+	 * as hush's per-command waitpid() did. The syscall's tick check lets
+	 * the scheduler run others when the slice is up, and a signal it
+	 * delivers is handled by dotrap() below. */
+	getppid();
+
 	dotrap();
 
 	switch (n->type) {
