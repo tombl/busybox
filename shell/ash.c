@@ -17,12 +17,10 @@
  */
 //config:config SHELL_ASH
 //config:	bool #hidden option
-//config:	depends on !NOMMU
 //config:
 //config:config ASH
 //config:	bool "ash (80 kb)"
 //config:	default y
-//config:	depends on !NOMMU
 //config:	select SHELL_ASH
 //config:	help
 //config:	The most complete and most pedantically correct shell included with
@@ -31,9 +29,7 @@
 //config:	(written by Kenneth Almquist) from NetBSD.
 //config:
 //config:# ash options
-//config:# note: Don't remove !NOMMU part in the next line; it would break
-//config:# menuconfig's indenting.
-//config:if !NOMMU && (SHELL_ASH || ASH || SH_IS_ASH || BASH_IS_ASH)
+//config:if SHELL_ASH || ASH || SH_IS_ASH || BASH_IS_ASH
 //config:
 //config:config ASH_OPTIMIZE_FOR_SIZE
 //config:	bool "Optimize for size instead of speed"
@@ -314,10 +310,6 @@ typedef long arith_t;
 
 #ifndef unlikely
 # define unlikely(cond) (cond)
-#endif
-
-#if !BB_MMU
-# error "Do not even bother, ash will not run on NOMMU machine"
 #endif
 
 /* ============ Hash table sizes. Configurable. */
